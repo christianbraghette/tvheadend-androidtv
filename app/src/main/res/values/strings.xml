@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Tvheadend</string>
+    <string name="setup_title">Tvheadend server</string>
+    <string name="host">Host or IP address</string>
+    <string name="port">Port</string>
+    <string name="https">Use HTTPS</string>
+    <string name="web_root">Web root (optional, e.g. /tvh)</string>
+    <string name="username">Username</string>
+    <string name="password">Password</string>
+    <string name="profile">Streaming profile</string>
+    <string name="connect">Connect and sync</string>
+</resources>
