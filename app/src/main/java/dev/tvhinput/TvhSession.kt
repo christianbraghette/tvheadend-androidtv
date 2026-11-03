@@ -117,9 +117,8 @@ class TvhSession(
         val uuid = channelUuid(channelUri) ?: return false
         currentChannelUuid = uuid
         retries = 0
-        playingSinceTune = false
         loadControl.startBufferUs = when {
-            unstableChannels.contains(uuid) -> UNSTABLE_START_BUFFER_US
+            isUnstable(uuid) -> UNSTABLE_START_BUFFER_US
             // HTSP delivers clean, already-demuxed packets and needs less cushion than raw TS.
             useHtsp -> HTSP_START_BUFFER_US
             else -> HTTP_START_BUFFER_US
@@ -130,6 +129,12 @@ class TvhSession(
         play(uuid)
         notifyContentAllowed()
         return true
+    }
+
+    /** A stall flags a channel for a week, so one network hiccup doesn't slow its zapping forever. */
+    private fun isUnstable(uuid: String): Boolean {
+        val flaggedAt = unstableChannels.all[uuid] as? Long ?: return false
+        return System.currentTimeMillis() - flaggedAt < UNSTABLE_FLAG_MS
     }
 
     /** Called on the loader thread when an HTSP subscription starts. */
@@ -143,6 +148,8 @@ class TvhSession(
     }
 
     private fun play(uuid: String) {
+        // The initial buffering of a (re)start is not a stall: only count stalls after playback began.
+        playingSinceTune = false
         val uri = if (useHtsp) "htsp://channel/${client.htspChannelId(uuid)}" else client.streamUrl(uuid)
         Log.i(TAG, "Playing $uri")
         val source = mediaSourceFactory.createMediaSource(MediaItem.fromUri(uri))
@@ -182,8 +189,12 @@ class TvhSession(
         if (trackId == null) {
             params.setTrackTypeDisabled(trackType, true)
         } else {
-            val (groupIndex, trackIndex) = trackId.split(':').map { it.toInt() }
+            // The id comes from the TV app: reject anything we didn't hand out instead of crashing.
+            val parts = trackId.split(':').mapNotNull { it.toIntOrNull() }
+            if (parts.size != 2) return false
+            val (groupIndex, trackIndex) = parts
             val group = player.currentTracks.groups.getOrNull(groupIndex) ?: return false
+            if (group.type != trackType || trackIndex !in 0 until group.length) return false
             params.setTrackTypeDisabled(trackType, false)
                 .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, trackIndex))
         }
@@ -235,9 +246,9 @@ class TvhSession(
                 handler.removeCallbacks(notifyBuffering)
                 handler.postDelayed(notifyBuffering, BUFFERING_NOTIFY_DELAY_MS)
                 val uuid = currentChannelUuid
-                if (playingSinceTune && uuid != null && !unstableChannels.contains(uuid)) {
-                    Log.i(TAG, "Channel $uuid stalled: using a bigger start buffer for it from now on")
-                    unstableChannels.edit().putBoolean(uuid, true).apply()
+                if (playingSinceTune && uuid != null && !isUnstable(uuid)) {
+                    Log.i(TAG, "Channel $uuid stalled: using a bigger start buffer for it for a while")
+                    unstableChannels.edit().putLong(uuid, System.currentTimeMillis()).apply()
                 }
             }
             Player.STATE_READY -> {
@@ -311,5 +322,6 @@ class TvhSession(
         const val HTTP_START_BUFFER_US = 2_500_000L
         const val HTSP_START_BUFFER_US = 2_000_000L
         const val UNSTABLE_START_BUFFER_US = 4_500_000L
+        const val UNSTABLE_FLAG_MS = 7 * 24 * 60 * 60 * 1000L
     }
 }

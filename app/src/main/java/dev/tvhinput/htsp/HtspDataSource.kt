@@ -31,6 +31,7 @@ class HtspDataSource(private val connections: () -> HtspConnection) :
     private var opened = false
     private var chunk: ByteArray? = null
     private var chunkPos = 0
+    @Volatile private var lastMessageNs = 0L
 
     override fun open(dataSpec: DataSpec): Long {
         uri = dataSpec.uri
@@ -38,6 +39,7 @@ class HtspDataSource(private val connections: () -> HtspConnection) :
         val channelId = dataSpec.uri.lastPathSegment?.toIntOrNull()
             ?: throw IOException("Invalid HTSP uri ${dataSpec.uri}")
         queue.clear()
+        lastMessageNs = System.nanoTime() // tuning can take a few seconds before the first message
         val c = connections()
         connection = c
         subscriptionId = c.subscribe(channelId, this)
@@ -52,7 +54,14 @@ class HtspDataSource(private val connections: () -> HtspConnection) :
         while (current == null || chunkPos >= current.size) {
             if (Thread.interrupted()) throw InterruptedIOException()
             when (val item = queue.poll(100, TimeUnit.MILLISECONDS)) {
-                null -> continue
+                null -> {
+                    // tvheadend sends status messages every second while subscribed: total silence
+                    // means a dead connection or stream, so fail and let the player resubscribe.
+                    if (System.nanoTime() - lastMessageNs > NO_DATA_TIMEOUT_NS) {
+                        throw IOException("No data from tvheadend for ${NO_DATA_TIMEOUT_NS / 1_000_000_000} s")
+                    }
+                    continue
+                }
                 is IOException -> throw item
                 is ByteArray -> {
                     current = item
@@ -82,6 +91,7 @@ class HtspDataSource(private val connections: () -> HtspConnection) :
     }
 
     override fun onMessage(msg: HtsMsg, body: ByteArray) {
+        lastMessageNs = System.nanoTime()
         when (msg.method) {
             "subscriptionStart", "muxpkt" -> queue.put(frame(body))
             "subscriptionStop" -> queue.put(
@@ -92,6 +102,10 @@ class HtspDataSource(private val connections: () -> HtspConnection) :
 
     override fun onConnectionLost(error: IOException) {
         queue.put(error)
+    }
+
+    private companion object {
+        const val NO_DATA_TIMEOUT_NS = 15_000_000_000L
     }
 
     private fun frame(body: ByteArray): ByteArray {

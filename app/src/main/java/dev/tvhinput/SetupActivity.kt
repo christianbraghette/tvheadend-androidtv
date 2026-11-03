@@ -69,14 +69,20 @@ class SetupActivity : Activity() {
     }
 
     private fun readForm(): TvhConfig? {
-        val h = host.text.toString().trim().substringAfter("://").trimEnd('/')
+        var h = host.text.toString().trim().substringAfter("://").substringBefore('/')
+        var p = port.text.toString().toIntOrNull()
+        // Accept "host:port" typed into the host field.
+        HOST_WITH_PORT.matchEntire(h)?.let { m ->
+            h = m.groupValues[1]
+            p = m.groupValues[2].toInt()
+        }
         if (h.isEmpty()) {
             host.error = getString(R.string.host)
             return null
         }
         return TvhConfig(
             host = h,
-            port = port.text.toString().toIntOrNull() ?: 9981,
+            port = p ?: 9981,
             https = https.isChecked,
             webRoot = webRoot.text.toString().trim(),
             username = username.text.toString().trim(),
@@ -85,6 +91,10 @@ class SetupActivity : Activity() {
             protocol = if (protocol.checkedRadioButtonId == R.id.protocol_htsp) StreamProtocol.HTSP else StreamProtocol.HTTP,
             htspPort = htspPort.text.toString().toIntOrNull() ?: 9982,
         )
+    }
+
+    private companion object {
+        val HOST_WITH_PORT = Regex("""([^:\[\]]+):(\d{1,5})""")
     }
 
     private fun connectAndSync() {

@@ -27,6 +27,7 @@ class HtspExtractor : Extractor {
     private val tracks = HashMap<Int, Track>()
     private var started = false
     private var baseTimeUs = C.TIME_UNSET
+    private var firstSeenUs = C.TIME_UNSET
     private var hasVideo = false
     private var droppedBeforeStart = 0
     private val header = ByteArray(4)
@@ -81,7 +82,10 @@ class HtspExtractor : Extractor {
         // A subscription starts mid-GOP: audio would play over a black screen until the next video
         // keyframe. Start the timeline at that keyframe and drop everything before it instead.
         if (baseTimeUs == C.TIME_UNSET) {
-            if (hasVideo && !(video && keyFrame)) {
+            if (firstSeenUs == C.TIME_UNSET) firstSeenUs = timestamp
+            // ...but don't wait forever: a scrambled or broken video stream must not mute the audio.
+            val waitedTooLong = timestamp - firstSeenUs > MAX_KEYFRAME_WAIT_US
+            if (hasVideo && !(video && keyFrame) && !waitedTooLong) {
                 droppedBeforeStart++
                 return
             }
@@ -173,6 +177,7 @@ class HtspExtractor : Extractor {
 
     private companion object {
         const val TAG = "HtspExtractor"
+        const val MAX_KEYFRAME_WAIT_US = 5_000_000L
         val SAMPLE_RATES = intArrayOf(96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350)
     }
 }
