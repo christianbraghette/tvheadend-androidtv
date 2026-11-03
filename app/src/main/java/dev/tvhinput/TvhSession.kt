@@ -2,6 +2,7 @@ package dev.tvhinput
 
 import android.content.Context
 import android.content.pm.ApplicationInfo
+import android.graphics.Color
 import android.media.tv.TvContract
 import android.media.tv.TvInputManager
 import android.media.tv.TvInputService
@@ -12,6 +13,7 @@ import android.os.Looper
 import android.util.Log
 import android.view.Surface
 import android.view.View
+import android.widget.FrameLayout
 import androidx.annotation.OptIn
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -22,13 +24,14 @@ import androidx.media3.common.Tracks
 import androidx.media3.common.text.CueGroup
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.exoplayer.util.EventLogger
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.extractor.DefaultExtractorsFactory
-import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory
 import androidx.media3.ui.SubtitleView
 
 /** One playback session: plays a tvheadend MPEG-TS stream onto the surface given by the TV app. */
@@ -42,10 +45,27 @@ class TvhSession(
 
     private val mediaSourceFactory = ProgressiveMediaSource.Factory(
         OkHttpDataSource.Factory(client.http),
-        DefaultExtractorsFactory().setTsExtractorFlags(DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES),
+        // No FLAG_ALLOW_NON_IDR_KEYFRAMES: start decoding at a real IDR frame, otherwise joining a live
+        // stream mid-GOP shows smeared/blocky pictures for the first moments.
+        DefaultExtractorsFactory(),
     )
 
+    private val trackSelector = DefaultTrackSelector(context)
+
     private val player: ExoPlayer = ExoPlayer.Builder(context)
+        .setTrackSelector(trackSelector)
+        // A live stream only arrives in real time, so start with a little cushion and
+        // refill more after a stall instead of stuttering at the live edge.
+        .setLoadControl(
+            DefaultLoadControl.Builder()
+                .setBufferDurationsMs(
+                    DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
+                    DefaultLoadControl.DEFAULT_MAX_BUFFER_MS,
+                    START_BUFFER_MS,
+                    REBUFFER_MS,
+                )
+                .build()
+        )
         .setRenderersFactory(
             DefaultRenderersFactory(context).setEnableDecoderFallback(true)
                 // Broadcast audio is often MP2/AC3; fall back to FFmpeg when the platform can't decode it.
@@ -71,6 +91,8 @@ class TvhSession(
     }
 
     private var subtitleView: SubtitleView? = null
+    private var shutterView: View? = null
+    private var shutterVisible = true
     private var currentChannelUuid: String? = null
     private var retries = 0
 
@@ -82,11 +104,21 @@ class TvhSession(
         val uuid = channelUuid(channelUri) ?: return false
         currentChannelUuid = uuid
         retries = 0
+        setTunneling(true)
         handler.removeCallbacksAndMessages(null)
         notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_TUNING)
+        setShutter(true)
         play(uuid)
         notifyContentAllowed()
         return true
+    }
+
+    /**
+     * Hardware A/V sync where the device supports it (e.g. Amlogic); ExoPlayer falls back
+     * by itself when a decoder can't tunnel, but not when the audio output can't.
+     */
+    private fun setTunneling(enabled: Boolean) {
+        trackSelector.setParameters(trackSelector.buildUponParameters().setTunnelingEnabled(enabled))
     }
 
     private fun play(uuid: String) {
@@ -138,7 +170,26 @@ class TvhSession(
         return true
     }
 
-    override fun onCreateOverlayView(): View = SubtitleView(context).also { subtitleView = it }
+    override fun onCreateOverlayView(): View {
+        val subtitles = SubtitleView(context).also { subtitleView = it }
+        val shutter = View(context).apply {
+            setBackgroundColor(Color.BLACK)
+            visibility = if (shutterVisible) View.VISIBLE else View.GONE
+        }.also { shutterView = it }
+        return FrameLayout(context).apply {
+            addView(shutter, FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+            addView(subtitles, FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+        }
+    }
+
+    /**
+     * The surface keeps the previous channel's last frame until the new decoder draws, and
+     * not every TV app hides it while tuning, so cover it ourselves until the first new frame.
+     */
+    private fun setShutter(visible: Boolean) {
+        shutterVisible = visible
+        shutterView?.visibility = if (visible) View.VISIBLE else View.GONE
+    }
 
     override fun onRelease() {
         handler.removeCallbacksAndMessages(null)
@@ -150,6 +201,7 @@ class TvhSession(
 
     override fun onRenderedFirstFrame() {
         Log.i(TAG, "First video frame rendered")
+        setShutter(false)
     }
 
     override fun onPlaybackStateChanged(state: Int) {
@@ -173,6 +225,15 @@ class TvhSession(
         Log.w(TAG, "Playback error: ${error.errorCodeName}", error)
         notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_UNKNOWN)
         val uuid = currentChannelUuid ?: return
+        // Some devices can't open a tunneled audio output for every format (e.g. mono MP2 on
+        // Chromecast with Google TV): retry this channel right away without tunneling.
+        if (error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED &&
+            trackSelector.parameters.tunnelingEnabled
+        ) {
+            setTunneling(false)
+            play(uuid)
+            return
+        }
         if (retries++ < MAX_RETRIES) {
             handler.postDelayed({ if (uuid == currentChannelUuid) play(uuid) }, RETRY_DELAY_MS)
         }
@@ -226,5 +287,7 @@ class TvhSession(
         const val MAX_RETRIES = 3
         const val RETRY_DELAY_MS = 2000L
         const val BUFFERING_NOTIFY_DELAY_MS = 1000L
+        const val START_BUFFER_MS = 2500
+        const val REBUFFER_MS = 5000
     }
 }
