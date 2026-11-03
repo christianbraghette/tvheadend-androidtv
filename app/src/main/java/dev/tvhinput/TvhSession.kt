@@ -38,7 +38,6 @@ import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.extractor.ExtractorsFactory
 import androidx.media3.extractor.text.DefaultSubtitleParserFactory
-import androidx.media3.extractor.text.SubtitleTranscodingExtractor
 import androidx.media3.ui.SubtitleView
 import dev.tvhinput.htsp.HtspConnection
 import dev.tvhinput.htsp.HtspDataSource
@@ -64,7 +63,7 @@ class TvhSession(
     private val mediaSourceFactory = if (useHtsp) {
         ProgressiveMediaSource.Factory(
             HtspDataSource.Factory(::connectHtsp) { error -> handler.post { onServerStatus(error) } },
-            ExtractorsFactory { arrayOf(SubtitleTranscodingExtractor(HtspExtractor(), DefaultSubtitleParserFactory())) },
+            ExtractorsFactory { arrayOf(HtspExtractor(DefaultSubtitleParserFactory())) },
         )
     } else {
         ProgressiveMediaSource.Factory(

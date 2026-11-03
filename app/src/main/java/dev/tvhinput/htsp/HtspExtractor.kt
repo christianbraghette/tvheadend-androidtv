@@ -13,13 +13,15 @@ import androidx.media3.extractor.ExtractorOutput
 import androidx.media3.extractor.PositionHolder
 import androidx.media3.extractor.SeekMap
 import androidx.media3.extractor.TrackOutput
+import androidx.media3.extractor.text.SubtitleParser
+import androidx.media3.extractor.text.SubtitleTranscodingExtractorOutput
 
 /**
  * Reads the htsmsg frames produced by [HtspDataSource]: `subscriptionStart` declares the
  * elementary streams, each `muxpkt` carries one already-demuxed frame of one stream.
  */
 @OptIn(UnstableApi::class)
-class HtspExtractor : Extractor {
+class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) : Extractor {
 
     private class Track(val output: TrackOutput, val codec: String, var format: Format) {
         val video = isVideo(codec)
@@ -41,7 +43,9 @@ class HtspExtractor : Extractor {
     override fun sniff(input: ExtractorInput) = true
 
     override fun init(output: ExtractorOutput) {
-        extractorOutput = output
+        // DVB subtitles are turned into ready-to-draw cues here, while extracting, as Media3's own
+        // extractors do (replaces the deprecated SubtitleTranscodingExtractor wrapper).
+        extractorOutput = SubtitleTranscodingExtractorOutput(output, subtitleParserFactory)
     }
 
     override fun read(input: ExtractorInput, seekPosition: PositionHolder): Int {
