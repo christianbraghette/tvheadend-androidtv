@@ -27,6 +27,8 @@ class HtspExtractor : Extractor {
     private val tracks = HashMap<Int, Track>()
     private var started = false
     private var baseTimeUs = C.TIME_UNSET
+    private var hasVideo = false
+    private var droppedBeforeStart = 0
     private val header = ByteArray(4)
     private var body = ByteArray(64 * 1024)
 
@@ -61,6 +63,7 @@ class HtspExtractor : Extractor {
             val output = extractorOutput.track(index, MimeTypes.getTrackType(format.sampleMimeType))
             output.format(format)
             tracks[index] = Track(output, codec, format)
+            if (isVideo(codec)) hasVideo = true
             Log.i(TAG, "Stream $index: $codec ${format.sampleMimeType} ${format.language ?: ""}")
         }
         extractorOutput.endTracks()
@@ -72,15 +75,24 @@ class HtspExtractor : Extractor {
         val track = tracks[msg.int("stream") ?: return] ?: return
         var payload = msg.bin("payload") ?: return
         val timestamp = msg.long("pts") ?: msg.long("dts") ?: return
-        if (baseTimeUs == C.TIME_UNSET) baseTimeUs = timestamp
+        val video = isVideo(track.codec)
+        val keyFrame = !video || msg.int("frametype") == 'I'.code
+
+        // A subscription starts mid-GOP: audio would play over a black screen until the next video
+        // keyframe. Start the timeline at that keyframe and drop everything before it instead.
+        if (baseTimeUs == C.TIME_UNSET) {
+            if (hasVideo && !(video && keyFrame)) {
+                droppedBeforeStart++
+                return
+            }
+            baseTimeUs = timestamp
+            Log.i(TAG, "Starting at first ${if (video) "keyframe" else "packet"}, dropped $droppedBeforeStart packets")
+        }
+        if (timestamp < baseTimeUs) return
 
         if (track.codec == "AAC") payload = stripAdts(track, payload) ?: return
 
-        val flags = when {
-            !isVideo(track.codec) -> C.BUFFER_FLAG_KEY_FRAME
-            msg.int("frametype") == 'I'.code -> C.BUFFER_FLAG_KEY_FRAME
-            else -> 0
-        }
+        val flags = if (keyFrame) C.BUFFER_FLAG_KEY_FRAME else 0
         track.output.sampleData(ParsableByteArray(payload), payload.size)
         track.output.sampleMetadata(timestamp - baseTimeUs, flags, payload.size, 0, null)
     }
@@ -138,6 +150,8 @@ class HtspExtractor : Extractor {
         if (isVideo(codec)) {
             stream.int("width")?.let { builder.setWidth(it) }
             stream.int("height")?.let { builder.setHeight(it) }
+            // Frame duration in µs.
+            stream.int("duration")?.takeIf { it > 0 }?.let { builder.setFrameRate(1_000_000f / it) }
         } else if (codec != "DVBSUB") {
             builder.setChannelCount(channels).setSampleRate(SAMPLE_RATES.getOrElse(rateIndex) { 48000 })
         }

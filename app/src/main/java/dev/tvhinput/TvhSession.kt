@@ -24,11 +24,9 @@ import androidx.media3.common.Tracks
 import androidx.media3.common.text.CueGroup
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.okhttp.OkHttpDataSource
-import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
-import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.exoplayer.util.EventLogger
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.extractor.DefaultExtractorsFactory
@@ -71,22 +69,15 @@ class TvhSession(
         )
     }
 
-    private val trackSelector = DefaultTrackSelector(context)
+    private val loadControl = LiveLoadControl()
 
+    // Channels that stalled before: their data arrives unevenly, so they get a bigger start cushion.
+    private val unstableChannels = context.getSharedPreferences("tvh_unstable_channels", Context.MODE_PRIVATE)
+
+    // No tunneled playback: on the Chromecast it started audio up to ~2 s before the first picture
+    // on most channels and failed on mono audio, with no measurable smoothness gain.
     private val player: ExoPlayer = ExoPlayer.Builder(context)
-        .setTrackSelector(trackSelector)
-        // A live stream only arrives in real time, so start with a little cushion and
-        // refill more after a stall instead of stuttering at the live edge.
-        .setLoadControl(
-            DefaultLoadControl.Builder()
-                .setBufferDurationsMs(
-                    DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
-                    DefaultLoadControl.DEFAULT_MAX_BUFFER_MS,
-                    START_BUFFER_MS,
-                    REBUFFER_MS,
-                )
-                .build()
-        )
+        .setLoadControl(loadControl)
         .setRenderersFactory(
             DefaultRenderersFactory(context).setEnableDecoderFallback(true)
                 // Broadcast audio is often MP2/AC3; fall back to FFmpeg when the platform can't decode it.
@@ -116,6 +107,7 @@ class TvhSession(
     private var shutterVisible = true
     private var currentChannelUuid: String? = null
     private var retries = 0
+    private var playingSinceTune = false
 
     init {
         setOverlayViewEnabled(true)
@@ -125,21 +117,19 @@ class TvhSession(
         val uuid = channelUuid(channelUri) ?: return false
         currentChannelUuid = uuid
         retries = 0
-        setTunneling(true)
+        playingSinceTune = false
+        loadControl.startBufferUs = when {
+            unstableChannels.contains(uuid) -> UNSTABLE_START_BUFFER_US
+            // HTSP delivers clean, already-demuxed packets and needs less cushion than raw TS.
+            useHtsp -> HTSP_START_BUFFER_US
+            else -> HTTP_START_BUFFER_US
+        }
         handler.removeCallbacksAndMessages(null)
         notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_TUNING)
         setShutter(true)
         play(uuid)
         notifyContentAllowed()
         return true
-    }
-
-    /**
-     * Hardware A/V sync where the device supports it (e.g. Amlogic); ExoPlayer falls back
-     * by itself when a decoder can't tunnel, but not when the audio output can't.
-     */
-    private fun setTunneling(enabled: Boolean) {
-        trackSelector.setParameters(trackSelector.buildUponParameters().setTunnelingEnabled(enabled))
     }
 
     /** Called on the loader thread when an HTSP subscription starts. */
@@ -244,9 +234,15 @@ class TvhSession(
             Player.STATE_BUFFERING -> {
                 handler.removeCallbacks(notifyBuffering)
                 handler.postDelayed(notifyBuffering, BUFFERING_NOTIFY_DELAY_MS)
+                val uuid = currentChannelUuid
+                if (playingSinceTune && uuid != null && !unstableChannels.contains(uuid)) {
+                    Log.i(TAG, "Channel $uuid stalled: using a bigger start buffer for it from now on")
+                    unstableChannels.edit().putBoolean(uuid, true).apply()
+                }
             }
             Player.STATE_READY -> {
                 handler.removeCallbacks(notifyBuffering)
+                playingSinceTune = true
                 retries = 0
                 if (player.currentTracks.isTypeSelected(C.TRACK_TYPE_VIDEO)) notifyVideoAvailable()
                 else notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_AUDIO_ONLY)
@@ -259,15 +255,6 @@ class TvhSession(
         Log.w(TAG, "Playback error: ${error.errorCodeName}", error)
         notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_UNKNOWN)
         val uuid = currentChannelUuid ?: return
-        // Some devices can't open a tunneled audio output for every format (e.g. mono MP2 on
-        // Chromecast with Google TV): retry this channel right away without tunneling.
-        if (error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED &&
-            trackSelector.parameters.tunnelingEnabled
-        ) {
-            setTunneling(false)
-            play(uuid)
-            return
-        }
         if (retries++ < MAX_RETRIES) {
             handler.postDelayed({ if (uuid == currentChannelUuid) play(uuid) }, RETRY_DELAY_MS)
         }
@@ -321,7 +308,8 @@ class TvhSession(
         const val MAX_RETRIES = 3
         const val RETRY_DELAY_MS = 2000L
         const val BUFFERING_NOTIFY_DELAY_MS = 1000L
-        const val START_BUFFER_MS = 2500
-        const val REBUFFER_MS = 5000
+        const val HTTP_START_BUFFER_US = 2_500_000L
+        const val HTSP_START_BUFFER_US = 2_000_000L
+        const val UNSTABLE_START_BUFFER_US = 4_500_000L
     }
 }
