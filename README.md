@@ -29,7 +29,7 @@ adb connect <tv-ip>:5555
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-The app has no launcher icon: add the source from your TV app's channel source settings
+The app is hidden from the home screen: open it from Settings > Apps to configure it, or add the source from your TV app's channel source settings
 (e.g. Mochi Live TV or Live Channels), enter the server address and credentials, pick the
 streaming protocol and choose *Connect and sync*.
 

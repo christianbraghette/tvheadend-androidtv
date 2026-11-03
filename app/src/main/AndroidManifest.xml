@@ -19,11 +19,18 @@
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
         android:usesCleartextTraffic="true">
 
-        <!-- No launcher entry: the app stays out of the app row and is configured
-             from the TV app's "channel sources" settings (see tvinputservice.xml). -->
+        <!-- Plain LAUNCHER (not LEANBACK_LAUNCHER): the TV home screen only lists
+             leanback apps, so the app stays out of the app row, but Settings > Apps
+             sees a launcher entry, lists it as a regular app and offers "Open".
+             The TV app still opens it from its "channel sources" settings too. -->
         <activity
             android:name=".SetupActivity"
-            android:exported="true" />
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
 
         <service
             android:name=".TvhInputService"
