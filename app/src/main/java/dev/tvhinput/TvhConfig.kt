@@ -2,6 +2,9 @@ package dev.tvhinput
 
 import android.content.Context
 
+/** How live streams are fetched. Channel and EPG sync always use the HTTP API. */
+enum class StreamProtocol { HTTP, HTSP }
+
 data class TvhConfig(
     val host: String,
     val port: Int = 9981,
@@ -10,6 +13,8 @@ data class TvhConfig(
     val username: String = "",
     val password: String = "",
     val profile: String = "pass",
+    val protocol: StreamProtocol = StreamProtocol.HTTP,
+    val htspPort: Int = 9982,
 )
 
 object Settings {
@@ -26,6 +31,9 @@ object Settings {
             username = p.getString("username", "").orEmpty(),
             password = p.getString("password", "").orEmpty(),
             profile = p.getString("profile", "pass").orEmpty(),
+            protocol = runCatching { StreamProtocol.valueOf(p.getString("protocol", null)!!) }
+                .getOrDefault(StreamProtocol.HTTP),
+            htspPort = p.getInt("htsp_port", 9982),
         )
     }
 
@@ -38,6 +46,8 @@ object Settings {
             .putString("username", config.username)
             .putString("password", config.password)
             .putString("profile", config.profile)
+            .putString("protocol", config.protocol.name)
+            .putInt("htsp_port", config.htspPort)
             .apply()
     }
 }

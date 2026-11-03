@@ -119,6 +119,16 @@ class TvhClient(val config: TvhConfig) {
             .build()
             .toString()
 
+    /**
+     * HTSP identifies channels by a number derived from the channel uuid: its first 4 bytes read
+     * as a little-endian int, top bit cleared (tvheadend idnode_get_short_uuid).
+     */
+    fun htspChannelId(channelUuid: String): Int {
+        var id = 0
+        for (i in 3 downTo 0) id = (id shl 8) or channelUuid.substring(i * 2, i * 2 + 2).toInt(16)
+        return id and 0x7fffffff
+    }
+
     /** Resolves an icon/image reference, which tvheadend gives either as absolute URL or as e.g. "imagecache/42". */
     fun resolve(ref: String): HttpUrl? =
         if (ref.startsWith("http://") || ref.startsWith("https://")) ref.toHttpUrlOrNull()

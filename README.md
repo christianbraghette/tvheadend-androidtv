@@ -8,7 +8,8 @@ regular TV source in Live Channels and in any other app that lists TV inputs.
 
 | Component | Role |
 |---|---|
-| `TvhInputService` / `TvhSession` | The TIF input. Tunes a channel by playing `/stream/channel/{uuid}` (MPEG-TS) with Media3 ExoPlayer, and reports audio/video/subtitle tracks to the TV app. |
+| `TvhInputService` / `TvhSession` | The TIF input. Plays a channel with Media3 ExoPlayer, over HTTP (`/stream/channel/{uuid}`, MPEG-TS) or HTSP, and reports audio/video/subtitle tracks to the TV app. |
+| `htsp/` | HTSP client: binary message codec, an authenticated connection shared by a session, and a `DataSource` + `Extractor` that feed subscription packets to ExoPlayer. |
 | `TvProviderSync` | Mirrors `/api/channel/grid` and `/api/epg/events/grid` into `TvContract.Channels` / `TvContract.Programs`, including channel logos. |
 | `SyncWorker` | WorkManager job that refreshes channels and EPG every 6 hours. |
 | `SetupActivity` | Server settings. The system TV app opens it when the source is added; it is also in the launcher. |
@@ -22,11 +23,15 @@ adb connect <tv-ip>:5555
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Then open the **Tvheadend** app from the launcher (or add the source from Live Channels → Settings →
-Channel sources), enter the server address and credentials, and choose *Connect and sync*.
+The app has no launcher icon: add the source from your TV app's channel source settings
+(e.g. Mochi Live TV or Live Channels), enter the server address and credentials, pick the
+streaming protocol and choose *Connect and sync*.
 
-The tvheadend user needs *Web interface* and *Streaming* rights. The streaming profile
-defaults to `pass` (the original stream, unmodified).
+- **HTTP**: streams MPEG-TS with the chosen streaming profile (default `pass`, the original stream).
+- **HTSP** (port 9982): one persistent connection per session, so channel changes skip the HTTP
+  connection and authentication. The tvheadend user needs HTSP streaming rights.
+
+Channel and EPG sync always use the HTTP API, so the user also needs *Web interface* rights.
 
 ## License
 
@@ -41,8 +46,8 @@ even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE
 
 ## Roadmap
 
-- HTSP protocol (faster zapping, timeshift, server-side subscription status)
-- Timeshift support via `onTimeShift*` session callbacks
+- Timeshift over HTSP via `onTimeShift*` session callbacks
+- Show HTSP subscription status (no free tuner, scrambled) as proper messages
 - DVR recordings exposed as `RecordedPrograms`
 - Radio channel detection (`SERVICE_TYPE_AUDIO`)
 - Channel tags as genre / filter

@@ -6,7 +6,9 @@ import android.os.Bundle
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.RadioGroup
 import android.widget.TextView
+import dev.tvhinput.htsp.HtspConnection
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
@@ -27,6 +29,8 @@ class SetupActivity : Activity() {
     private lateinit var username: EditText
     private lateinit var password: EditText
     private lateinit var profile: EditText
+    private lateinit var protocol: RadioGroup
+    private lateinit var htspPort: EditText
     private lateinit var connect: Button
     private lateinit var status: TextView
 
@@ -40,6 +44,8 @@ class SetupActivity : Activity() {
         username = findViewById(R.id.username)
         password = findViewById(R.id.password)
         profile = findViewById(R.id.profile)
+        protocol = findViewById(R.id.protocol)
+        htspPort = findViewById(R.id.htsp_port)
         connect = findViewById(R.id.connect)
         status = findViewById(R.id.status)
 
@@ -51,6 +57,8 @@ class SetupActivity : Activity() {
             username.setText(c.username)
             password.setText(c.password)
             profile.setText(c.profile)
+            protocol.check(if (c.protocol == StreamProtocol.HTSP) R.id.protocol_htsp else R.id.protocol_http)
+            htspPort.setText(c.htspPort.toString())
         }
         connect.setOnClickListener { connectAndSync() }
     }
@@ -74,6 +82,8 @@ class SetupActivity : Activity() {
             username = username.text.toString().trim(),
             password = password.text.toString(),
             profile = profile.text.toString().trim(),
+            protocol = if (protocol.checkedRadioButtonId == R.id.protocol_htsp) StreamProtocol.HTSP else StreamProtocol.HTTP,
+            htspPort = htspPort.text.toString().toIntOrNull() ?: 9982,
         )
     }
 
@@ -85,9 +95,14 @@ class SetupActivity : Activity() {
             try {
                 val client = TvhClient(config)
                 val info = withContext(Dispatchers.IO) { client.serverInfo() }
+                if (config.protocol == StreamProtocol.HTSP) {
+                    status.text = "Checking HTSP…"
+                    // Fail here, not at the first tune, if HTSP is unreachable or not allowed.
+                    withContext(Dispatchers.IO) { HtspConnection.connect(config).close() }
+                }
                 Settings.save(this@SetupActivity, config)
 
-                status.text = "Connected to ${info.name} ${info.version}. Importing channels…"
+                status.text = "Connected to ${info.name} ${info.version} (${config.protocol}). Importing channels…"
                 val sync = TvProviderSync(applicationContext, client)
                 val channels = withContext(Dispatchers.IO) { sync.syncChannels() }
 

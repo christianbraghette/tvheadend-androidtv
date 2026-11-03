@@ -41,6 +41,42 @@
             android:layout_height="wrap_content"
             android:text="@string/https" />
 
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/protocol" />
+
+        <RadioGroup
+            android:id="@+id/protocol"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:checkedButton="@+id/protocol_http"
+            android:orientation="horizontal">
+
+            <RadioButton
+                android:id="@+id/protocol_http"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/protocol_http" />
+
+            <RadioButton
+                android:id="@+id/protocol_htsp"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="24dp"
+                android:text="@string/protocol_htsp" />
+        </RadioGroup>
+
+        <EditText
+            android:id="@+id/htsp_port"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/htsp_port"
+            android:imeOptions="actionNext"
+            android:inputType="number"
+            android:text="9982" />
+
         <EditText
             android:id="@+id/web_root"
             android:layout_width="match_parent"

@@ -23,6 +23,11 @@ android {
         }
     }
 
+    testOptions {
+        // Lets JVM unit tests run code that logs through android.util.Log.
+        unitTests.isReturnDefaultValues = true
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -45,4 +50,6 @@ dependencies {
     implementation("androidx.work:work-runtime-ktx:2.10.2")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+
+    testImplementation("junit:junit:4.13.2")
 }

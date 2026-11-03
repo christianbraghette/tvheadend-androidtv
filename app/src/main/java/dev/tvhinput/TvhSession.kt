@@ -32,9 +32,16 @@ import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.exoplayer.util.EventLogger
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.extractor.DefaultExtractorsFactory
+import androidx.media3.extractor.ExtractorsFactory
+import androidx.media3.extractor.text.DefaultSubtitleParserFactory
+import androidx.media3.extractor.text.SubtitleTranscodingExtractor
 import androidx.media3.ui.SubtitleView
+import dev.tvhinput.htsp.HtspConnection
+import dev.tvhinput.htsp.HtspDataSource
+import dev.tvhinput.htsp.HtspExtractor
+import java.io.IOException
 
-/** One playback session: plays a tvheadend MPEG-TS stream onto the surface given by the TV app. */
+/** One playback session: plays a tvheadend channel (HTTP MPEG-TS or HTSP) onto the TV app's surface. */
 @OptIn(UnstableApi::class)
 class TvhSession(
     private val context: Context,
@@ -43,12 +50,26 @@ class TvhSession(
 
     private val handler = Handler(Looper.getMainLooper())
 
-    private val mediaSourceFactory = ProgressiveMediaSource.Factory(
-        OkHttpDataSource.Factory(client.http),
-        // No FLAG_ALLOW_NON_IDR_KEYFRAMES: start decoding at a real IDR frame, otherwise joining a live
-        // stream mid-GOP shows smeared/blocky pictures for the first moments.
-        DefaultExtractorsFactory(),
-    )
+    private val useHtsp = client.config.protocol == StreamProtocol.HTSP
+
+    // One HTSP connection per session, reused across tunes so a zap is just unsubscribe + subscribe.
+    private val htspLock = Any()
+    @Volatile private var htspConnection: HtspConnection? = null
+    @Volatile private var released = false
+
+    private val mediaSourceFactory = if (useHtsp) {
+        ProgressiveMediaSource.Factory(
+            HtspDataSource.Factory(::connectHtsp),
+            ExtractorsFactory { arrayOf(SubtitleTranscodingExtractor(HtspExtractor(), DefaultSubtitleParserFactory())) },
+        )
+    } else {
+        ProgressiveMediaSource.Factory(
+            OkHttpDataSource.Factory(client.http),
+            // No FLAG_ALLOW_NON_IDR_KEYFRAMES: start decoding at a real IDR frame, otherwise joining a live
+            // stream mid-GOP shows smeared/blocky pictures for the first moments.
+            DefaultExtractorsFactory(),
+        )
+    }
 
     private val trackSelector = DefaultTrackSelector(context)
 
@@ -121,9 +142,20 @@ class TvhSession(
         trackSelector.setParameters(trackSelector.buildUponParameters().setTunnelingEnabled(enabled))
     }
 
+    /** Called on the loader thread when an HTSP subscription starts. */
+    private fun connectHtsp(): HtspConnection = synchronized(htspLock) {
+        if (released) throw IOException("Session released")
+        htspConnection?.takeIf { !it.isClosed }?.let { return it }
+        HtspConnection.connect(client.config).also {
+            htspConnection = it
+            if (released) it.close()
+        }
+    }
+
     private fun play(uuid: String) {
-        Log.i(TAG, "Playing ${client.streamUrl(uuid)}")
-        val source = mediaSourceFactory.createMediaSource(MediaItem.fromUri(client.streamUrl(uuid)))
+        val uri = if (useHtsp) "htsp://channel/${client.htspChannelId(uuid)}" else client.streamUrl(uuid)
+        Log.i(TAG, "Playing $uri")
+        val source = mediaSourceFactory.createMediaSource(MediaItem.fromUri(uri))
         player.setMediaSource(source)
         player.prepare()
         player.playWhenReady = true
@@ -195,6 +227,8 @@ class TvhSession(
         handler.removeCallbacksAndMessages(null)
         player.removeListener(this)
         player.release()
+        released = true
+        htspConnection?.close()
     }
 
     // Player.Listener

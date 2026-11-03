@@ -8,6 +8,10 @@
     <string name="web_root">Web root (optional, e.g. /tvh)</string>
     <string name="username">Username</string>
     <string name="password">Password</string>
-    <string name="profile">Streaming profile</string>
+    <string name="profile">Streaming profile (HTTP only)</string>
+    <string name="protocol">Streaming protocol</string>
+    <string name="protocol_http">HTTP</string>
+    <string name="protocol_htsp">HTSP</string>
+    <string name="htsp_port">HTSP port</string>
     <string name="connect">Connect and sync</string>
 </resources>
