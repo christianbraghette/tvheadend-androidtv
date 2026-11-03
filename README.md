@@ -9,11 +9,17 @@ regular TV source in Live Channels and in any other app that lists TV inputs.
 | Component | Role |
 |---|---|
 | `TvhInputService` / `TvhSession` | The TIF input. Plays a channel with Media3 ExoPlayer, over HTTP (`/stream/channel/{uuid}`, MPEG-TS) or HTSP, and reports audio/video/subtitle tracks to the TV app. |
-| `htsp/` | HTSP client: binary message codec, an authenticated connection shared by a session, and a `DataSource` + `Extractor` that feed subscription packets to ExoPlayer. |
-| `TvProviderSync` | Mirrors `/api/channel/grid` and `/api/epg/events/grid` into `TvContract.Channels` / `TvContract.Programs`, including channel logos. |
+| `htsp/` | HTSP client: binary message codec, an authenticated connection shared by a session, and a `DataSource` + `Extractor` that feed subscription packets to ExoPlayer without copying or re-parsing them. |
+| `StartBufferTuner` / `LiveLoadControl` | Per-channel start buffer, learned from how low the buffer gets while watching: channels that arrive evenly start faster, ones that stall get more cushion. |
+| `NeighbourPrewarmer` | HTSP only: keeps the previous/next channel tuned at low priority when they are on another multiplex, with their streams switched off, so zapping to them skips the retune. Dropped after 2 minutes without zapping. |
+| `TvProviderSync` | Mirrors `/api/channel/grid` and `/api/epg/events/grid` into `TvContract.Channels` / `TvContract.Programs`, including channel logos and radio channel detection. |
 | `SyncWorker` | WorkManager job that refreshes channels and EPG every 6 hours. |
-| `SetupActivity` | Server settings. The system TV app opens it when the source is added; it is also in the launcher. |
+| `SetupActivity` | Server settings. The TV app opens it when the source is added, and from its channel source settings later. |
 | `TvhAuthenticator` | HTTP Basic and Digest (MD5 / SHA-256) auth, matching tvheadend's auth modes. |
+
+Playback details: MP2/AC3/E-AC3 audio is decoded with FFmpeg (most Android TV devices lack these
+decoders), DVB subtitles are supported, and non-square-pixel channels (e.g. 960x1080, 720x576)
+are shown at their real 16:9 aspect ratio.
 
 ## Build and install
 
@@ -33,6 +39,14 @@ streaming protocol and choose *Connect and sync*.
 
 Channel and EPG sync always use the HTTP API, so the user also needs *Web interface* rights.
 
+### Release build
+
+In Android Studio: **Build → Generate Signed App Bundle or APK → APK**, create (first time) or
+choose your keystore, pick the `release` variant. The APK ends up in `app/release/`.
+Raise `versionCode` in `app/build.gradle.kts` for every release, and keep the keystore safe:
+updates must be signed with the same key. A release build can't be installed over a debug
+build (different keys): uninstall the debug build first.
+
 ## License
 
 Copyright (C) 2026 Christian Braghette
@@ -47,7 +61,5 @@ even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE
 ## Roadmap
 
 - Timeshift over HTSP via `onTimeShift*` session callbacks
-- Show HTSP subscription status (no free tuner, scrambled) as proper messages
 - DVR recordings exposed as `RecordedPrograms`
-- Radio channel detection (`SERVICE_TYPE_AUDIO`)
 - Channel tags as genre / filter

@@ -5,3 +5,9 @@ build/
 local.properties
 *.iml
 captures/
+
+# Release signing: keys, their passwords and signed builds stay out of git.
+*.jks
+*.keystore
+keystore.properties
+app/release/

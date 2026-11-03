@@ -16,8 +16,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * Setup screen. Launched by the system TV app when the user adds this input,
- * and also from the launcher to change the server or force a resync.
+ * Setup screen. The TV app opens it when the user adds this input, and again from its
+ * channel source settings to change the server or force a resync (there is no launcher entry).
  */
 class SetupActivity : Activity() {
     private val scope = MainScope()
@@ -93,42 +93,42 @@ class SetupActivity : Activity() {
         )
     }
 
-    private companion object {
-        val HOST_WITH_PORT = Regex("""([^:\[\]]+):(\d{1,5})""")
-    }
-
     private fun connectAndSync() {
         val config = readForm() ?: return
         connect.isEnabled = false
-        status.text = "Connecting…"
+        status.text = getString(R.string.setup_connecting)
         scope.launch {
             try {
                 val client = TvhClient(config)
                 val info = withContext(Dispatchers.IO) { client.serverInfo() }
                 if (config.protocol == StreamProtocol.HTSP) {
-                    status.text = "Checking HTSP…"
+                    status.text = getString(R.string.setup_checking_htsp)
                     // Fail here, not at the first tune, if HTSP is unreachable or not allowed.
                     withContext(Dispatchers.IO) { HtspConnection.connect(config).close() }
                 }
                 Settings.save(this@SetupActivity, config)
 
-                status.text = "Connected to ${info.name} ${info.version} (${config.protocol}). Importing channels…"
+                status.text = getString(R.string.setup_importing, info.name, info.version, config.protocol.name)
                 val sync = TvProviderSync(applicationContext, client)
                 val channels = withContext(Dispatchers.IO) { sync.syncChannels() }
 
-                status.text = "Imported ${channels.size} channels. Loading program guide…"
+                status.text = getString(R.string.setup_loading_guide, channels.size)
                 val programs = withContext(Dispatchers.IO) { sync.syncPrograms(channels) }
                 SyncWorker.schedule(applicationContext)
 
-                status.text = "Done: ${channels.size} channels, $programs programs."
+                status.text = getString(R.string.setup_done, channels.size, programs)
                 setResult(RESULT_OK)
                 // When opened from the system TV app's "add source" flow, return to it.
                 if (intent.hasExtra(TvInputInfo.EXTRA_INPUT_ID)) finish()
             } catch (e: Exception) {
-                status.text = "Error: ${e.message ?: e.javaClass.simpleName}"
+                status.text = getString(R.string.setup_error, e.message ?: e.javaClass.simpleName)
             } finally {
                 connect.isEnabled = true
             }
         }
+    }
+
+    private companion object {
+        val HOST_WITH_PORT = Regex("""([^:\[\]]+):(\d{1,5})""")
     }
 }

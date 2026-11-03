@@ -1,5 +1,6 @@
 package dev.tvhinput
 
+import android.annotation.SuppressLint
 import android.content.ContentProviderOperation
 import android.content.ContentValues
 import android.content.Context
@@ -172,7 +173,10 @@ class TvProviderSync(private val context: Context, private val client: TvhClient
         put(TvContract.Programs.COLUMN_EPISODE_DISPLAY_NUMBER, e.episode?.toString())
         put(TvContract.Programs.COLUMN_POSTER_ART_URI, e.image?.let { client.resolve(it)?.toString() })
         val genres = e.genres.mapNotNull(::canonicalGenre).distinct()
-        put(TvContract.Programs.COLUMN_CANONICAL_GENRE, if (genres.isEmpty()) null else Genres.encode(*genres.toTypedArray()))
+        // All values come from canonicalGenre's Genres constants; lint can't follow them through the array.
+        @SuppressLint("WrongConstant")
+        val encodedGenres = if (genres.isEmpty()) null else Genres.encode(*genres.toTypedArray())
+        put(TvContract.Programs.COLUMN_CANONICAL_GENRE, encodedGenres)
     }
 
     /** Maps the DVB content descriptor (EN 300 468) top nibble to Android's canonical genres. */

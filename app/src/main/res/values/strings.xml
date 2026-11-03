@@ -22,4 +22,10 @@
     <string name="status_other">Channel unavailable (%1$s)</string>
     <string name="status_failed">Channel unavailable</string>
     <string name="connect">Connect and sync</string>
+    <string name="setup_connecting">Connecting…</string>
+    <string name="setup_checking_htsp">Checking HTSP…</string>
+    <string name="setup_importing">Connected to %1$s %2$s (%3$s). Importing channels…</string>
+    <string name="setup_loading_guide">Imported %1$d channels. Loading program guide…</string>
+    <string name="setup_done">Done: %1$d channels, %2$d programs.</string>
+    <string name="setup_error">Error: %1$s</string>
 </resources>
