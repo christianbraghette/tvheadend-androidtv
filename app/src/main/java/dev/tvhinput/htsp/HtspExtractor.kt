@@ -97,7 +97,10 @@ class HtspExtractor : Extractor {
             output.format(format)
             tracks[index] = Track(output, codec, format)
             if (isVideo(codec)) hasVideo = true
-            Log.i(TAG, "Stream $index: $codec ${format.sampleMimeType} ${format.language ?: ""}")
+            val video = if (isVideo(codec)) {
+                " ${format.width}x${format.height} aspect=${stream.int("aspect_num")}:${stream.int("aspect_den")} par=${format.pixelWidthHeightRatio}"
+            } else ""
+            Log.i(TAG, "Stream $index: $codec ${format.sampleMimeType} ${format.language ?: ""}$video")
         }
         extractorOutput.endTracks()
         extractorOutput.seekMap(SeekMap.Unseekable(C.TIME_UNSET))
@@ -195,8 +198,18 @@ class HtspExtractor : Extractor {
             else -> return null // teletext, RDS, ... are not played
         }
         if (isVideo(codec)) {
-            stream.int("width")?.let { builder.setWidth(it) }
-            stream.int("height")?.let { builder.setHeight(it) }
+            val width = stream.int("width") ?: 0
+            val height = stream.int("height") ?: 0
+            if (width > 0) builder.setWidth(width)
+            if (height > 0) builder.setHeight(height)
+            // Many DVB channels use non-square pixels (e.g. 960x1080 or 720x576 shown at 16:9).
+            // tvheadend reports the display aspect ratio: turn it into a pixel aspect ratio, or
+            // the picture is shown squeezed (960x1080 even narrower than 4:3).
+            val aspectNum = stream.int("aspect_num") ?: 0
+            val aspectDen = stream.int("aspect_den") ?: 0
+            if (width > 0 && height > 0 && aspectNum > 0 && aspectDen > 0) {
+                builder.setPixelWidthHeightRatio((aspectNum.toFloat() * height) / (aspectDen.toFloat() * width))
+            }
             // Frame duration in µs.
             stream.int("duration")?.takeIf { it > 0 }?.let { builder.setFrameRate(1_000_000f / it) }
         } else if (codec != "DVBSUB") {
