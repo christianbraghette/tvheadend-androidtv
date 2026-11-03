@@ -12,6 +12,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.Surface
@@ -76,8 +77,35 @@ class TvhSession(
 
     private val loadControl = LiveLoadControl()
 
-    // Channels that stalled before: their data arrives unevenly, so they get a bigger start cushion.
-    private val unstableChannels = context.getSharedPreferences("tvh_unstable_channels", Context.MODE_PRIVATE)
+    // Per-channel start buffer, learned from how low the buffer gets while watching.
+    private val startBuffers = StartBufferTuner(
+        context.getSharedPreferences(if (useHtsp) "tvh_start_buffer_htsp" else "tvh_start_buffer_http", Context.MODE_PRIVATE),
+        // HTSP delivers clean, already-demuxed packets and needs less cushion than raw TS.
+        // Below ~1 s the video decoder can drain the buffer into its input queue and stall at start.
+        if (useHtsp) StartBufferTuner.Limits(defaultUs = 1_500_000L, minUs = 1_000_000L, maxUs = 5_000_000L)
+        else StartBufferTuner.Limits(defaultUs = 2_500_000L, minUs = 1_200_000L, maxUs = 6_000_000L),
+    )
+
+    /** What one uninterrupted playback of a channel has shown about its buffer needs. */
+    private class Watch(val uuid: String, val startBufferUs: Long) {
+        var readyAtMs = 0L
+        var bufferedAtStartUs = 0L
+        var minBufferedUs = Long.MAX_VALUE
+        var stalled = false
+        var reported = false
+    }
+
+    private var watch: Watch? = null
+
+    private val sampleBuffer = object : Runnable {
+        override fun run() {
+            val w = watch ?: return
+            if (w.stalled || w.reported || player.playbackState != Player.STATE_READY) return
+            w.minBufferedUs = minOf(w.minBufferedUs, player.totalBufferedDuration * 1000)
+            // Report once after a while, so a long viewing counts even if the app is killed later.
+            if (SystemClock.elapsedRealtime() - w.readyAtMs >= WATCH_REPORT_MS) finishWatch() else handler.postDelayed(this, BUFFER_SAMPLE_MS)
+        }
+    }
 
     // No tunneled playback: on the Chromecast it started audio up to ~2 s before the first picture
     // on most channels and failed on mono audio, with no measurable smoothness gain.
@@ -119,6 +147,8 @@ class TvhSession(
 
     init {
         setOverlayViewEnabled(true)
+        // Replaced by the learned per-channel start buffers.
+        context.deleteSharedPreferences("tvh_unstable_channels")
     }
 
     override fun onTune(channelUri: Uri): Boolean {
@@ -127,12 +157,6 @@ class TvhSession(
         currentChannelUuid = uuid
         retries = 0
         showStatus(null)
-        loadControl.startBufferUs = when {
-            isUnstable(uuid) -> UNSTABLE_START_BUFFER_US
-            // HTSP delivers clean, already-demuxed packets and needs less cushion than raw TS.
-            useHtsp -> HTSP_START_BUFFER_US
-            else -> HTTP_START_BUFFER_US
-        }
         handler.removeCallbacksAndMessages(null)
         notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_TUNING)
         setShutter(true)
@@ -141,10 +165,15 @@ class TvhSession(
         return true
     }
 
-    /** A stall flags a channel for a week, so one network hiccup doesn't slow its zapping forever. */
-    private fun isUnstable(uuid: String): Boolean {
-        val flaggedAt = unstableChannels.all[uuid] as? Long ?: return false
-        return System.currentTimeMillis() - flaggedAt < UNSTABLE_FLAG_MS
+    /** Reports what the current playback showed, if it ran long enough to mean something. */
+    private fun finishWatch() {
+        val w = watch ?: return
+        handler.removeCallbacks(sampleBuffer)
+        if (w.stalled || w.reported || w.readyAtMs == 0L) return
+        w.reported = true
+        val watchedMs = SystemClock.elapsedRealtime() - w.readyAtMs
+        if (watchedMs < MIN_WATCH_MS) return
+        startBuffers.onWatched(w.uuid, w.startBufferUs, w.bufferedAtStartUs, w.minBufferedUs, watchedMs)
     }
 
     /** Called on the loader thread when an HTSP subscription starts. */
@@ -160,8 +189,15 @@ class TvhSession(
     private fun play(uuid: String) {
         // The initial buffering of a (re)start is not a stall: only count stalls after playback began.
         playingSinceTune = false
+        finishWatch()
+        val startBufferUs = startBuffers.startBufferUs(uuid)
+        loadControl.startBufferUs = startBufferUs
+        // After a stall, resume with a bit more than the start cushion: a fixed 3 s turned a
+        // 0.2 s decoder hiccup into a 1.5 s freeze.
+        loadControl.rebufferUs = startBufferUs + REBUFFER_EXTRA_US
+        watch = Watch(uuid, startBufferUs)
         val uri = if (useHtsp) "htsp://channel/${client.htspChannelId(uuid)}" else client.streamUrl(uuid)
-        Log.i(TAG, "Playing $uri")
+        Log.i(TAG, "Playing $uri (start buffer ${startBufferUs / 1000} ms)")
         val source = mediaSourceFactory.createMediaSource(MediaItem.fromUri(uri))
         player.setMediaSource(source)
         player.prepare()
@@ -293,6 +329,7 @@ class TvhSession(
     }
 
     override fun onRelease() {
+        finishWatch()
         handler.removeCallbacksAndMessages(null)
         player.removeListener(this)
         player.release()
@@ -313,15 +350,23 @@ class TvhSession(
             Player.STATE_BUFFERING -> {
                 handler.removeCallbacks(notifyBuffering)
                 handler.postDelayed(notifyBuffering, BUFFERING_NOTIFY_DELAY_MS)
-                val uuid = currentChannelUuid
-                if (playingSinceTune && uuid != null && !isUnstable(uuid)) {
-                    Log.i(TAG, "Channel $uuid stalled: using a bigger start buffer for it for a while")
-                    unstableChannels.edit().putLong(uuid, System.currentTimeMillis()).apply()
+                val w = watch
+                // A stall counts even after a clean report: the channel needs more cushion either way.
+                if (playingSinceTune && w != null && !w.stalled) {
+                    w.stalled = true
+                    handler.removeCallbacks(sampleBuffer)
+                    startBuffers.onStall(w.uuid, w.startBufferUs)
                 }
             }
             Player.STATE_READY -> {
                 handler.removeCallbacks(notifyBuffering)
                 playingSinceTune = true
+                watch?.takeIf { it.readyAtMs == 0L }?.let {
+                    it.readyAtMs = SystemClock.elapsedRealtime()
+                    it.bufferedAtStartUs = player.totalBufferedDuration * 1000
+                    it.minBufferedUs = it.bufferedAtStartUs
+                    handler.postDelayed(sampleBuffer, BUFFER_SAMPLE_MS)
+                }
                 retries = 0
                 showStatus(null)
                 if (player.currentTracks.isTypeSelected(C.TRACK_TYPE_VIDEO)) {
@@ -411,10 +456,10 @@ class TvhSession(
         const val MAX_RETRIES = 3
         const val RETRY_DELAY_MS = 2000L
         const val BUFFERING_NOTIFY_DELAY_MS = 1000L
-        const val HTTP_START_BUFFER_US = 2_500_000L
-        const val HTSP_START_BUFFER_US = 2_000_000L
-        const val UNSTABLE_START_BUFFER_US = 4_500_000L
-        const val UNSTABLE_FLAG_MS = 7 * 24 * 60 * 60 * 1000L
+        const val BUFFER_SAMPLE_MS = 250L
+        const val REBUFFER_EXTRA_US = 1_000_000L
+        const val MIN_WATCH_MS = 15_000L
+        const val WATCH_REPORT_MS = 60_000L
 
         // These reasons exist from Android 11; older TV apps get the generic one.
         val REASON_INSUFFICIENT_RESOURCE =
