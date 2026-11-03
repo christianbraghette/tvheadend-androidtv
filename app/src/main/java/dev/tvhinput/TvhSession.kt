@@ -1,5 +1,6 @@
 package dev.tvhinput
 
+import android.content.ContentValues
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.graphics.Color
@@ -8,12 +9,15 @@ import android.media.tv.TvInputManager
 import android.media.tv.TvInputService
 import android.media.tv.TvTrackInfo
 import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.Gravity
 import android.view.Surface
 import android.view.View
 import android.widget.FrameLayout
+import android.widget.TextView
 import androidx.annotation.OptIn
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -23,6 +27,7 @@ import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.common.text.CueGroup
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
@@ -57,7 +62,7 @@ class TvhSession(
 
     private val mediaSourceFactory = if (useHtsp) {
         ProgressiveMediaSource.Factory(
-            HtspDataSource.Factory(::connectHtsp),
+            HtspDataSource.Factory(::connectHtsp) { error -> handler.post { onServerStatus(error) } },
             ExtractorsFactory { arrayOf(SubtitleTranscodingExtractor(HtspExtractor(), DefaultSubtitleParserFactory())) },
         )
     } else {
@@ -105,6 +110,9 @@ class TvhSession(
     private var subtitleView: SubtitleView? = null
     private var shutterView: View? = null
     private var shutterVisible = true
+    private var statusView: TextView? = null
+    private var statusText: String? = null
+    private var currentChannelUri: Uri? = null
     private var currentChannelUuid: String? = null
     private var retries = 0
     private var playingSinceTune = false
@@ -115,8 +123,10 @@ class TvhSession(
 
     override fun onTune(channelUri: Uri): Boolean {
         val uuid = channelUuid(channelUri) ?: return false
+        currentChannelUri = channelUri
         currentChannelUuid = uuid
         retries = 0
+        showStatus(null)
         loadControl.startBufferUs = when {
             isUnstable(uuid) -> UNSTABLE_START_BUFFER_US
             // HTSP delivers clean, already-demuxed packets and needs less cushion than raw TS.
@@ -209,9 +219,67 @@ class TvhSession(
             setBackgroundColor(Color.BLACK)
             visibility = if (shutterVisible) View.VISIBLE else View.GONE
         }.also { shutterView = it }
+        val status = TextView(context).apply {
+            setTextColor(Color.WHITE)
+            textSize = 22f
+            setBackgroundColor(0xB0000000.toInt())
+            setPadding(48, 24, 48, 24)
+            text = statusText
+            visibility = if (statusText != null) View.VISIBLE else View.GONE
+        }.also { statusView = it }
         return FrameLayout(context).apply {
             addView(shutter, FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
             addView(subtitles, FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+            addView(status, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER,
+            ))
+        }
+    }
+
+    /** Shows a message over the video, e.g. why tvheadend can't play the channel; null hides it. */
+    private fun showStatus(text: String?) {
+        statusText = text
+        statusView?.apply {
+            this.text = text
+            visibility = if (text != null) View.VISIBLE else View.GONE
+        }
+    }
+
+    /** A tvheadend subscription problem (HTSP "subscriptionError"), or null once it cleared. */
+    private fun onServerStatus(error: String?) {
+        if (error == null) {
+            showStatus(null)
+            return
+        }
+        Log.i(TAG, "Server status: $error")
+        val (message, reason) = when (error) {
+            "noFreeAdapter" -> context.getString(R.string.status_no_tuner) to REASON_INSUFFICIENT_RESOURCE
+            "scrambled" -> context.getString(R.string.status_scrambled) to REASON_SCRAMBLED
+            "badSignal", "weakStream" -> context.getString(R.string.status_no_signal) to TvInputManager.VIDEO_UNAVAILABLE_REASON_WEAK_SIGNAL
+            "tuningFailed" -> context.getString(R.string.status_tuning_failed) to TvInputManager.VIDEO_UNAVAILABLE_REASON_UNKNOWN
+            "subscriptionOverridden" -> context.getString(R.string.status_overridden) to REASON_INSUFFICIENT_RESOURCE
+            "userLimit", "userAccess" -> context.getString(R.string.status_user_limit) to TvInputManager.VIDEO_UNAVAILABLE_REASON_UNKNOWN
+            else -> context.getString(R.string.status_other, error) to TvInputManager.VIDEO_UNAVAILABLE_REASON_UNKNOWN
+        }
+        showStatus(message)
+        notifyVideoUnavailable(reason)
+    }
+
+    /**
+     * Playback found no video stream at all: it's a radio channel. Remember it and tell TV apps,
+     * which can then show it as audio-only (and the next sync keeps it that way).
+     */
+    private fun markRadio(uuid: String, channelUri: Uri) {
+        if (uuid in RadioChannels.load(context)) return
+        Log.i(TAG, "Channel $uuid has no video: marking it as radio")
+        RadioChannels.add(context, uuid)
+        val values = ContentValues().apply {
+            put(TvContract.Channels.COLUMN_SERVICE_TYPE, TvProviderSync.serviceType(radio = true))
+        }
+        try {
+            context.contentResolver.update(channelUri, values, null, null)
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Couldn't update channel type: ${e.message}")
         }
     }
 
@@ -255,8 +323,25 @@ class TvhSession(
                 handler.removeCallbacks(notifyBuffering)
                 playingSinceTune = true
                 retries = 0
-                if (player.currentTracks.isTypeSelected(C.TRACK_TYPE_VIDEO)) notifyVideoAvailable()
-                else notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_AUDIO_ONLY)
+                showStatus(null)
+                if (player.currentTracks.isTypeSelected(C.TRACK_TYPE_VIDEO)) {
+                    notifyVideoAvailable()
+                } else {
+                    notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_AUDIO_ONLY)
+                    val uuid = currentChannelUuid
+                    val uri = currentChannelUri
+                    // Only a stream without any video track is radio, not one whose video can't be decoded.
+                    if (uuid != null && uri != null && player.currentTracks.groups.none { it.type == C.TRACK_TYPE_VIDEO }) {
+                        markRadio(uuid, uri)
+                    }
+                }
+            }
+            Player.STATE_ENDED -> {
+                // A live channel never ends: the stream closed or tvheadend changed its streams.
+                currentChannelUuid?.let {
+                    Log.i(TAG, "Stream ended, restarting channel")
+                    play(it)
+                }
             }
             else -> Unit
         }
@@ -264,10 +349,17 @@ class TvhSession(
 
     override fun onPlayerError(error: PlaybackException) {
         Log.w(TAG, "Playback error: ${error.errorCodeName}", error)
-        notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_UNKNOWN)
         val uuid = currentChannelUuid ?: return
+        // tvheadend answers an HTTP stream request it can't serve (no free tuner, ...) with 503.
+        val httpCode = generateSequence<Throwable>(error) { it.cause }
+            .filterIsInstance<HttpDataSource.InvalidResponseCodeException>()
+            .firstOrNull()?.responseCode
+        if (httpCode == 503) onServerStatus("noFreeAdapter")
+        else notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_UNKNOWN)
         if (retries++ < MAX_RETRIES) {
             handler.postDelayed({ if (uuid == currentChannelUuid) play(uuid) }, RETRY_DELAY_MS)
+        } else if (statusText == null) {
+            showStatus(context.getString(R.string.status_failed))
         }
     }
 
@@ -323,5 +415,13 @@ class TvhSession(
         const val HTSP_START_BUFFER_US = 2_000_000L
         const val UNSTABLE_START_BUFFER_US = 4_500_000L
         const val UNSTABLE_FLAG_MS = 7 * 24 * 60 * 60 * 1000L
+
+        // These reasons exist from Android 11; older TV apps get the generic one.
+        val REASON_INSUFFICIENT_RESOURCE =
+            if (Build.VERSION.SDK_INT >= 30) TvInputManager.VIDEO_UNAVAILABLE_REASON_INSUFFICIENT_RESOURCE
+            else TvInputManager.VIDEO_UNAVAILABLE_REASON_UNKNOWN
+        val REASON_SCRAMBLED =
+            if (Build.VERSION.SDK_INT >= 30) TvInputManager.VIDEO_UNAVAILABLE_REASON_CAS_UNKNOWN
+            else TvInputManager.VIDEO_UNAVAILABLE_REASON_UNKNOWN
     }
 }

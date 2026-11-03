@@ -35,10 +35,9 @@ data class TvhEvent(
 /** Thin client for the tvheadend HTTP/JSON API. All calls are blocking. */
 class TvhClient(val config: TvhConfig) {
 
-    val http: OkHttpClient = OkHttpClient.Builder()
+    // newBuilder() shares the base client's connection pool and threads across all TvhClients.
+    val http: OkHttpClient = BASE_HTTP.newBuilder()
         .authenticator(TvhAuthenticator(config.username, config.password))
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
     private val baseUrl: HttpUrl = HttpUrl.Builder()
@@ -149,4 +148,11 @@ class TvhClient(val config: TvhConfig) {
 
     private fun JSONObject.optStringOrNull(key: String): String? =
         if (isNull(key)) null else optString(key).takeIf { it.isNotBlank() }
+
+    private companion object {
+        val BASE_HTTP: OkHttpClient = OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .build()
+    }
 }

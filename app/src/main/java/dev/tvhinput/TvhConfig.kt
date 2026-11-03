@@ -23,13 +23,18 @@ object Settings {
     fun load(context: Context): TvhConfig? {
         val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val host = p.getString("host", null)?.takeIf { it.isNotBlank() } ?: return null
+        // Older versions stored the password in plain text: move it to the encrypted field.
+        p.getString("password", null)?.let { legacy ->
+            p.edit().putString("password_enc", SecretBox.encrypt(legacy)).remove("password").apply()
+            return load(context)
+        }
         return TvhConfig(
             host = host,
             port = p.getInt("port", 9981),
             https = p.getBoolean("https", false),
             webRoot = p.getString("web_root", "").orEmpty(),
             username = p.getString("username", "").orEmpty(),
-            password = p.getString("password", "").orEmpty(),
+            password = p.getString("password_enc", null)?.let(SecretBox::decrypt).orEmpty(),
             profile = p.getString("profile", "pass").orEmpty(),
             protocol = runCatching { StreamProtocol.valueOf(p.getString("protocol", null)!!) }
                 .getOrDefault(StreamProtocol.HTTP),
@@ -44,7 +49,8 @@ object Settings {
             .putBoolean("https", config.https)
             .putString("web_root", config.webRoot)
             .putString("username", config.username)
-            .putString("password", config.password)
+            .putString("password_enc", SecretBox.encrypt(config.password))
+            .remove("password")
             .putString("profile", config.profile)
             .putString("protocol", config.protocol.name)
             .putInt("htsp_port", config.htspPort)

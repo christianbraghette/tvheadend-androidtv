@@ -17,12 +17,25 @@ import java.util.concurrent.TimeUnit
  * returns are the subscription's raw htsmsg frames, which [HtspExtractor] turns into samples.
  */
 @OptIn(UnstableApi::class)
-class HtspDataSource(private val connections: () -> HtspConnection) :
-    BaseDataSource(/* isNetwork= */ true), HtspConnection.SubscriptionListener {
+class HtspDataSource(
+    private val connections: () -> HtspConnection,
+    private val onStatus: (subscriptionError: String?) -> Unit,
+) : BaseDataSource(/* isNetwork= */ true), HtspConnection.SubscriptionListener {
 
-    class Factory(private val connections: () -> HtspConnection) : DataSource.Factory {
-        override fun createDataSource(): DataSource = HtspDataSource(connections)
+    /**
+     * [onStatus] receives tvheadend's subscription problems ("noFreeAdapter", "scrambled", ...) as
+     * they happen, and null once the subscription is fine again. It is called on the reader thread.
+     */
+    class Factory(
+        private val connections: () -> HtspConnection,
+        private val onStatus: (String?) -> Unit,
+    ) : DataSource.Factory {
+        override fun createDataSource(): DataSource = HtspDataSource(connections, onStatus)
     }
+
+    private object EndOfStream
+
+    @Volatile private var streamsSignature: List<String>? = null
 
     private val queue = LinkedBlockingQueue<Any>()
     private var connection: HtspConnection? = null
@@ -39,6 +52,7 @@ class HtspDataSource(private val connections: () -> HtspConnection) :
         val channelId = dataSpec.uri.lastPathSegment?.toIntOrNull()
             ?: throw IOException("Invalid HTSP uri ${dataSpec.uri}")
         queue.clear()
+        streamsSignature = null
         lastMessageNs = System.nanoTime() // tuning can take a few seconds before the first message
         val c = connections()
         connection = c
@@ -63,6 +77,7 @@ class HtspDataSource(private val connections: () -> HtspConnection) :
                     continue
                 }
                 is IOException -> throw item
+                EndOfStream -> return C.RESULT_END_OF_INPUT
                 is ByteArray -> {
                     current = item
                     chunk = item
@@ -93,10 +108,25 @@ class HtspDataSource(private val connections: () -> HtspConnection) :
     override fun onMessage(msg: HtsMsg, body: ByteArray) {
         lastMessageNs = System.nanoTime()
         when (msg.method) {
-            "subscriptionStart", "muxpkt" -> queue.put(frame(body))
-            "subscriptionStop" -> queue.put(
-                IOException("Subscription stopped: ${msg.str("subscriptionError") ?: msg.str("status") ?: "unknown"}")
-            )
+            "muxpkt" -> queue.put(frame(body))
+            "subscriptionStart" -> {
+                val signature = msg.list("streams").map { (it as? HtsMsg)?.let { s -> "${s.int("index")}:${s.str("type")}" } ?: "" }
+                val previous = streamsSignature
+                when {
+                    previous == null -> {
+                        streamsSignature = signature
+                        queue.put(frame(body))
+                    }
+                    // Tracks can't be added to a prepared player: end the stream so the session
+                    // restarts the channel with the new set of streams.
+                    previous != signature -> queue.put(EndOfStream)
+                }
+            }
+            "subscriptionStatus" -> onStatus(msg.str("subscriptionError"))
+            "subscriptionStop" -> {
+                msg.str("subscriptionError")?.let(onStatus)
+                queue.put(IOException("Subscription stopped: ${msg.str("subscriptionError") ?: msg.str("status") ?: "unknown"}"))
+            }
         }
     }
 

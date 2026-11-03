@@ -13,5 +13,13 @@
     <string name="protocol_http">HTTP</string>
     <string name="protocol_htsp">HTSP</string>
     <string name="htsp_port">HTSP port</string>
+    <string name="status_no_tuner">No free tuner available</string>
+    <string name="status_scrambled">This channel is scrambled</string>
+    <string name="status_no_signal">No signal</string>
+    <string name="status_tuning_failed">Tuning failed</string>
+    <string name="status_overridden">The tuner is being used by a recording</string>
+    <string name="status_user_limit">Streaming limit reached on the server</string>
+    <string name="status_other">Channel unavailable (%1$s)</string>
+    <string name="status_failed">Channel unavailable</string>
     <string name="connect">Connect and sync</string>
 </resources>
