@@ -76,7 +76,10 @@ class HtspDataSource(
                     // tvheadend sends status messages every second while subscribed: total silence
                     // means a dead connection or stream, so fail and let the player resubscribe.
                     if (System.nanoTime() - lastMessageNs > NO_DATA_TIMEOUT_NS) {
-                        throw IOException("No data from tvheadend for ${NO_DATA_TIMEOUT_NS / 1_000_000_000} s")
+                        val reason = "No data from tvheadend for ${NO_DATA_TIMEOUT_NS / 1_000_000_000} s"
+                        // Don't reuse a connection that may be dead: the retry opens a fresh one.
+                        connection?.abort(reason)
+                        throw IOException(reason)
                     }
                     continue
                 }

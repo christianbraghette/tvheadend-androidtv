@@ -192,8 +192,8 @@ class NeighbourPrewarmer(
             if (indexes.isEmpty() || connection.isClosed) return
             try {
                 connection.request(
+                    // Default timeout: a timed-out request now closes the whole connection.
                     HtsMsg.of("method" to "subscriptionFilterStream", "subscriptionId" to subscriptionId, "disable" to indexes),
-                    timeoutMs = 3000,
                 )
                 Log.i(TAG, "Pre-tune of ${names[uuid] ?: uuid} started; streams off")
             } catch (e: IOException) {

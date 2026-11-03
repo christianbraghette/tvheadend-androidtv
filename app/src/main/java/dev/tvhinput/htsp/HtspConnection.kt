@@ -13,8 +13,11 @@ import java.security.MessageDigest
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
@@ -42,9 +45,14 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
     private val pending = ConcurrentHashMap<Int, CompletableFuture<HtsMsg>>()
     private val subscriptions = ConcurrentHashMap<Int, SubscriptionListener>()
 
-    @Volatile
-    var isClosed = false
-        private set
+    private val closed = AtomicBoolean()
+
+    val isClosed: Boolean get() = closed.get()
+
+    /** When the last message arrived: a connection that went silent is checked with a ping. */
+    @Volatile private var lastReceivedNs = System.nanoTime()
+    private val pingInFlight = AtomicBoolean()
+    private var watchdog: ScheduledFuture<*>? = null
 
     var serverName = ""
         private set
@@ -53,7 +61,30 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
 
     private fun start() {
         thread(name = "htsp-reader", isDaemon = true) { readLoop() }
+        watchdog = TIMER.scheduleWithFixedDelay(::checkAlive, WATCHDOG_MS, WATCHDOG_MS, TimeUnit.MILLISECONDS)
     }
+
+    /**
+     * A TCP connection can die without an error (Wi-Fi drop, roaming, the server losing us):
+     * reads then just wait forever and every request times out. When nothing has arrived for a
+     * while, ask the server for its time; no answer means the connection is dead.
+     */
+    private fun checkAlive() {
+        if (isClosed) return
+        if (System.nanoTime() - lastReceivedNs < IDLE_BEFORE_PING_NS) return
+        if (!pingInFlight.compareAndSet(false, true)) return
+        thread(name = "htsp-ping", isDaemon = true) {
+            try {
+                request(HtsMsg.of("method" to "getSysTime"), PING_TIMEOUT_MS) // a timeout closes us
+            } catch (_: IOException) {
+            } finally {
+                pingInFlight.set(false)
+            }
+        }
+    }
+
+    /** Declares the connection dead (e.g. a stream stopped arriving): everyone using it gets an error. */
+    fun abort(reason: String) = fail(IOException(reason))
 
     /** Sends a request and waits for its reply; server-side errors are thrown as IOException. */
     fun request(msg: HtsMsg, timeoutMs: Long = 10_000): HtsMsg {
@@ -68,7 +99,11 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
             if (result.int("noaccess") == 1) throw IOException("HTSP access denied: check the user's HTSP streaming rights")
             return result
         } catch (e: TimeoutException) {
-            throw IOException("HTSP ${msg.method} timed out")
+            // tvheadend answers every request: no reply means the connection is gone, even if the
+            // socket hasn't noticed. Close it so the next user reconnects instead of reusing it.
+            val error = IOException("HTSP ${msg.method} timed out")
+            fail(error)
+            throw error
         } catch (e: ExecutionException) {
             throw e.cause as? IOException ?: IOException(e.cause)
         } catch (e: InterruptedException) {
@@ -120,6 +155,7 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
         try {
             while (!isClosed) {
                 val length = input.readInt()
+                lastReceivedNs = System.nanoTime()
                 if (length < 0 || length > MAX_MESSAGE) throw IOException("Bad HTSP message length $length")
                 val body = BufferPool.obtain(length)
                 input.readFully(body, 0, length)
@@ -152,21 +188,26 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
     }
 
     private fun fail(error: IOException) {
-        if (isClosed) return
+        if (!closeSocket()) return
         Log.w(TAG, "HTSP connection lost: ${error.message}")
-        close()
         pending.values.forEach { it.completeExceptionally(error) }
         subscriptions.values.forEach { it.onConnectionLost(error) }
         subscriptions.clear()
     }
 
     override fun close() {
-        if (isClosed) return
-        isClosed = true
+        closeSocket()
+    }
+
+    /** True if this call closed it. */
+    private fun closeSocket(): Boolean {
+        if (!closed.compareAndSet(false, true)) return false
+        watchdog?.cancel(false)
         try {
             socket.close()
         } catch (_: IOException) {
         }
+        return true
     }
 
     companion object {
@@ -177,6 +218,10 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
         private val SEQ = HtsFieldReader.name("seq")
         private val SUBSCRIPTION_ID = HtsFieldReader.name("subscriptionId")
         private val METHOD = HtsFieldReader.name("method")
+        private const val WATCHDOG_MS = 5_000L
+        private const val IDLE_BEFORE_PING_NS = 10_000_000_000L
+        private const val PING_TIMEOUT_MS = 5_000L
+        private val TIMER = Executors.newSingleThreadScheduledExecutor { Thread(it, "htsp-watchdog").apply { isDaemon = true } }
 
         /** Opens a connection, says hello and authenticates when a username is configured. */
         fun connect(config: TvhConfig): HtspConnection {
@@ -184,6 +229,7 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
             try {
                 socket.connect(InetSocketAddress(config.host, config.htspPort), 5000)
                 socket.tcpNoDelay = true
+                socket.keepAlive = true
             } catch (e: IOException) {
                 socket.close()
                 throw e
