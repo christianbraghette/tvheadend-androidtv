@@ -79,12 +79,18 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
         }
     }
 
-    /** Starts streaming a channel; the listener must be ready before the first packet arrives. */
-    fun subscribe(channelId: Int, listener: SubscriptionListener): Int {
+    /**
+     * Starts streaming a channel; the listener must be ready before the first packet arrives.
+     * [weight] is tvheadend's priority (default 150 for HTSP): a lower one gives up its tuner to
+     * any higher subscription that needs it.
+     */
+    fun subscribe(channelId: Int, listener: SubscriptionListener, weight: Int? = null): Int {
         val id = subscriptionIds.incrementAndGet()
         subscriptions[id] = listener
         try {
-            request(HtsMsg.of("method" to "subscribe", "channelId" to channelId, "subscriptionId" to id))
+            val msg = HtsMsg.of("method" to "subscribe", "channelId" to channelId, "subscriptionId" to id)
+            if (weight != null) msg["weight"] = weight
+            request(msg)
         } catch (e: IOException) {
             subscriptions.remove(id)
             throw e

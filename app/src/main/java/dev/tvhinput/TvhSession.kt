@@ -75,6 +75,8 @@ class TvhSession(
         )
     }
 
+    private val prewarmer = if (useHtsp) NeighbourPrewarmer(context, client, ::connectHtsp) else null
+
     private val loadControl = LiveLoadControl()
 
     // Per-channel start buffer, learned from how low the buffer gets while watching.
@@ -333,6 +335,7 @@ class TvhSession(
         handler.removeCallbacksAndMessages(null)
         player.removeListener(this)
         player.release()
+        prewarmer?.release() // closing the connection below also ends its subscriptions
         released = true
         htspConnection?.close()
     }
@@ -366,6 +369,8 @@ class TvhSession(
                     it.bufferedAtStartUs = player.totalBufferedDuration * 1000
                     it.minBufferedUs = it.bufferedAtStartUs
                     handler.postDelayed(sampleBuffer, BUFFER_SAMPLE_MS)
+                    // Once this channel plays, keep its neighbours tuned for the next zap.
+                    prewarmer?.let { p -> handler.postDelayed({ if (watch === it) p.update(it.uuid) }, PREWARM_DELAY_MS) }
                 }
                 retries = 0
                 showStatus(null)
@@ -458,6 +463,7 @@ class TvhSession(
         const val BUFFERING_NOTIFY_DELAY_MS = 1000L
         const val BUFFER_SAMPLE_MS = 250L
         const val REBUFFER_EXTRA_US = 1_000_000L
+        const val PREWARM_DELAY_MS = 2000L
         const val MIN_WATCH_MS = 15_000L
         const val WATCH_REPORT_MS = 60_000L
 
