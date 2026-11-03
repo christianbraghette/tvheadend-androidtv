@@ -42,7 +42,11 @@ class HtspDataSource(
     private var subscriptionId = 0
     private var uri: Uri? = null
     private var opened = false
-    private var chunk: ByteArray? = null
+    /** One subscription message: the first [length] bytes of a [BufferPool] buffer. */
+    private class Chunk(val data: ByteArray, val length: Int)
+
+    private var chunk: Chunk? = null
+    /** Read position in [chunk]: -4..-1 while emitting its length header, then the body offset. */
     private var chunkPos = 0
     @Volatile private var lastMessageNs = 0L
 
@@ -65,7 +69,7 @@ class HtspDataSource(
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
         if (length == 0) return 0
         var current = chunk
-        while (current == null || chunkPos >= current.size) {
+        while (current == null) {
             if (Thread.interrupted()) throw InterruptedIOException()
             when (val item = queue.poll(100, TimeUnit.MILLISECONDS)) {
                 null -> {
@@ -78,16 +82,27 @@ class HtspDataSource(
                 }
                 is IOException -> throw item
                 EndOfStream -> return C.RESULT_END_OF_INPUT
-                is ByteArray -> {
+                is Chunk -> {
                     current = item
                     chunk = item
-                    chunkPos = 0
+                    chunkPos = -4
                 }
             }
         }
-        val n = minOf(length, current.size - chunkPos)
-        System.arraycopy(current, chunkPos, buffer, offset, n)
+        val n: Int
+        if (chunkPos < 0) {
+            // The 4-byte big-endian length that HtspExtractor expects before each message.
+            n = minOf(length, -chunkPos)
+            for (i in 0 until n) buffer[offset + i] = (current.length ushr (8 * (-chunkPos - 1 - i))).toByte()
+        } else {
+            n = minOf(length, current.length - chunkPos)
+            System.arraycopy(current.data, chunkPos, buffer, offset, n)
+        }
         chunkPos += n
+        if (chunkPos == current.length) {
+            BufferPool.recycle(current.data)
+            chunk = null
+        }
         bytesTransferred(n)
         return n
     }
@@ -97,37 +112,49 @@ class HtspDataSource(
     override fun close() {
         connection?.unsubscribe(subscriptionId)
         connection = null
-        queue.clear()
+        chunk?.let { BufferPool.recycle(it.data) }
         chunk = null
+        while (true) {
+            val item = queue.poll() ?: break
+            if (item is Chunk) BufferPool.recycle(item.data)
+        }
         if (opened) {
             opened = false
             transferEnded()
         }
     }
 
-    override fun onMessage(msg: HtsMsg, body: ByteArray) {
+    override fun onMessage(method: String, body: ByteArray, length: Int) {
         lastMessageNs = System.nanoTime()
-        when (msg.method) {
-            "muxpkt" -> queue.put(frame(body))
+        // muxpkt (nearly all traffic) goes to HtspExtractor undecoded; only the rare control
+        // messages are decoded here.
+        if (method == "muxpkt") {
+            queue.put(Chunk(body, length))
+            return
+        }
+        val msg = if (method.startsWith("subscription")) HtsMsg.deserialize(body, 0, length) else null
+        when (method) {
             "subscriptionStart" -> {
-                val signature = msg.list("streams").map { (it as? HtsMsg)?.let { s -> "${s.int("index")}:${s.str("type")}" } ?: "" }
+                val signature = msg!!.list("streams").map { (it as? HtsMsg)?.let { s -> "${s.int("index")}:${s.str("type")}" } ?: "" }
                 val previous = streamsSignature
                 when {
                     previous == null -> {
                         streamsSignature = signature
-                        queue.put(frame(body))
+                        queue.put(Chunk(body, length))
+                        return // the queue owns the buffer now
                     }
                     // Tracks can't be added to a prepared player: end the stream so the session
                     // restarts the channel with the new set of streams.
                     previous != signature -> queue.put(EndOfStream)
                 }
             }
-            "subscriptionStatus" -> onStatus(msg.str("subscriptionError"))
+            "subscriptionStatus" -> onStatus(msg!!.str("subscriptionError"))
             "subscriptionStop" -> {
-                msg.str("subscriptionError")?.let(onStatus)
+                msg!!.str("subscriptionError")?.let(onStatus)
                 queue.put(IOException("Subscription stopped: ${msg.str("subscriptionError") ?: msg.str("status") ?: "unknown"}"))
             }
         }
+        BufferPool.recycle(body)
     }
 
     override fun onConnectionLost(error: IOException) {
@@ -136,15 +163,5 @@ class HtspDataSource(
 
     private companion object {
         const val NO_DATA_TIMEOUT_NS = 15_000_000_000L
-    }
-
-    private fun frame(body: ByteArray): ByteArray {
-        val out = ByteArray(body.size + 4)
-        out[0] = (body.size ushr 24).toByte()
-        out[1] = (body.size ushr 16).toByte()
-        out[2] = (body.size ushr 8).toByte()
-        out[3] = body.size.toByte()
-        System.arraycopy(body, 0, out, 4, body.size)
-        return out
     }
 }

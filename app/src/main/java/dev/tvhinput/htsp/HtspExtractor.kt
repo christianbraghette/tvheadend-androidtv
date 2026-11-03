@@ -21,7 +21,10 @@ import androidx.media3.extractor.TrackOutput
 @OptIn(UnstableApi::class)
 class HtspExtractor : Extractor {
 
-    private class Track(val output: TrackOutput, val codec: String, var format: Format)
+    private class Track(val output: TrackOutput, val codec: String, var format: Format) {
+        val video = isVideo(codec)
+        val aac = codec == "AAC"
+    }
 
     private lateinit var extractorOutput: ExtractorOutput
     private val tracks = HashMap<Int, Track>()
@@ -32,6 +35,8 @@ class HtspExtractor : Extractor {
     private var droppedBeforeStart = 0
     private val header = ByteArray(4)
     private var body = ByteArray(64 * 1024)
+    private val fields = HtsFieldReader()
+    private val sample = ParsableByteArray()
 
     override fun sniff(input: ExtractorInput) = true
 
@@ -45,10 +50,37 @@ class HtspExtractor : Extractor {
             ((header[2].toInt() and 0xff) shl 8) or (header[3].toInt() and 0xff)
         if (body.size < length) body = ByteArray(length)
         input.readFully(body, 0, length)
-        val msg = HtsMsg.deserialize(body, 0, length)
-        when (msg.method) {
-            "subscriptionStart" -> onStart(msg)
-            "muxpkt" -> onPacket(msg)
+
+        // Read muxpkt fields in place: no map, no boxing, and the payload is never copied.
+        var method: String? = null
+        var stream = -1
+        var pts = NONE
+        var dts = NONE
+        var frameType = 0
+        var payloadOffset = -1
+        var payloadLength = 0
+        fields.reset(body, 0, length)
+        while (fields.next()) {
+            when {
+                fields.nameIs(METHOD) -> method = fields.method()
+                fields.nameIs(STREAM) -> stream = fields.long().toInt()
+                fields.nameIs(PTS) -> pts = fields.long()
+                fields.nameIs(DTS) -> dts = fields.long()
+                fields.nameIs(FRAMETYPE) -> frameType = fields.long().toInt()
+                fields.nameIs(PAYLOAD) -> {
+                    payloadOffset = fields.dataOffset
+                    payloadLength = fields.dataLength
+                }
+            }
+        }
+        when (method) {
+            "subscriptionStart" -> onStart(HtsMsg.deserialize(body, 0, length))
+            "muxpkt" -> {
+                val timestamp = if (pts != NONE) pts else dts
+                if (timestamp != NONE && payloadOffset >= 0) {
+                    onPacket(stream, timestamp, frameType, payloadOffset, payloadLength)
+                }
+            }
         }
         return Extractor.RESULT_CONTINUE
     }
@@ -72,12 +104,11 @@ class HtspExtractor : Extractor {
         started = true
     }
 
-    private fun onPacket(msg: HtsMsg) {
-        val track = tracks[msg.int("stream") ?: return] ?: return
-        var payload = msg.bin("payload") ?: return
-        val timestamp = msg.long("pts") ?: msg.long("dts") ?: return
-        val video = isVideo(track.codec)
-        val keyFrame = !video || msg.int("frametype") == 'I'.code
+    /** One muxpkt; its payload is `body[offset, offset + size)`. */
+    private fun onPacket(stream: Int, timestamp: Long, frameType: Int, offset: Int, size: Int) {
+        val track = tracks[stream] ?: return
+        val video = track.video
+        val keyFrame = !video || frameType == 'I'.code
 
         // A subscription starts mid-GOP: audio would play over a black screen until the next video
         // keyframe. Start the timeline at that keyframe and drop everything before it instead.
@@ -94,34 +125,46 @@ class HtspExtractor : Extractor {
         }
         if (timestamp < baseTimeUs) return
 
-        if (track.codec == "AAC") payload = stripAdts(track, payload) ?: return
+        var start = offset
+        if (track.aac) {
+            val skip = adtsHeaderSize(track, offset, size)
+            if (skip < 0) return
+            start += skip
+        }
+        val sampleSize = offset + size - start
 
         val flags = if (keyFrame) C.BUFFER_FLAG_KEY_FRAME else 0
-        track.output.sampleData(ParsableByteArray(payload), payload.size)
-        track.output.sampleMetadata(timestamp - baseTimeUs, flags, payload.size, 0, null)
+        sample.reset(body, start + sampleSize)
+        sample.setPosition(start)
+        track.output.sampleData(sample, sampleSize)
+        track.output.sampleMetadata(timestamp - baseTimeUs, flags, sampleSize, 0, null)
     }
 
     /**
      * tvheadend delivers AAC (including converted LATM) as ADTS frames, while decoders want raw
-     * frames plus an AudioSpecificConfig: strip the header and keep the config in sync with it.
+     * frames plus an AudioSpecificConfig: returns how many header bytes to skip (-1 to drop the
+     * frame) and keeps the config in sync with the header.
      */
-    private fun stripAdts(track: Track, frame: ByteArray): ByteArray? {
-        if (frame.size < 7 || frame[0] != 0xff.toByte() || (frame[1].toInt() and 0xf0) != 0xf0) return frame
-        val headerSize = if (frame[1].toInt() and 0x01 == 0) 9 else 7 // protection_absent == 0 adds a CRC
-        if (frame.size <= headerSize) return null
-        val objectType = ((frame[2].toInt() shr 6) and 0x03) + 1
-        val rateIndex = (frame[2].toInt() shr 2) and 0x0f
-        val channelConfig = ((frame[2].toInt() and 0x01) shl 2) or ((frame[3].toInt() shr 6) and 0x03)
-        val config = audioSpecificConfig(objectType, rateIndex, channelConfig)
-        if (!track.format.initializationData.firstOrNull().contentEquals(config)) {
+    private fun adtsHeaderSize(track: Track, offset: Int, size: Int): Int {
+        val b = body
+        if (size < 7 || b[offset] != 0xff.toByte() || (b[offset + 1].toInt() and 0xf0) != 0xf0) return 0
+        val headerSize = if (b[offset + 1].toInt() and 0x01 == 0) 9 else 7 // protection_absent == 0 adds a CRC
+        if (size <= headerSize) return -1
+        val objectType = ((b[offset + 2].toInt() shr 6) and 0x03) + 1
+        val rateIndex = (b[offset + 2].toInt() shr 2) and 0x0f
+        val channelConfig = ((b[offset + 2].toInt() and 0x01) shl 2) or ((b[offset + 3].toInt() shr 6) and 0x03)
+        val current = track.format.initializationData.firstOrNull()
+        val config0 = ((objectType shl 3) or (rateIndex shr 1)).toByte()
+        val config1 = (((rateIndex and 0x01) shl 7) or (channelConfig shl 3)).toByte()
+        if (current == null || current.size != 2 || current[0] != config0 || current[1] != config1) {
             track.format = track.format.buildUpon()
-                .setInitializationData(listOf(config))
+                .setInitializationData(listOf(audioSpecificConfig(objectType, rateIndex, channelConfig)))
                 .setSampleRate(SAMPLE_RATES.getOrElse(rateIndex) { track.format.sampleRate })
                 .setChannelCount(if (channelConfig in 1..6) channelConfig else track.format.channelCount)
                 .build()
             track.output.format(track.format)
         }
-        return frame.copyOfRange(headerSize, frame.size)
+        return headerSize
     }
 
     private fun formatFor(index: Int, codec: String, stream: HtsMsg): Format? {
@@ -162,8 +205,6 @@ class HtspExtractor : Extractor {
         return builder.build()
     }
 
-    private fun isVideo(codec: String) = codec == "H264" || codec == "HEVC" || codec == "MPEG2VIDEO"
-
     private fun audioSpecificConfig(objectType: Int, rateIndex: Int, channelConfig: Int) = byteArrayOf(
         ((objectType shl 3) or (rateIndex shr 1)).toByte(),
         (((rateIndex and 0x01) shl 7) or (channelConfig shl 3)).toByte(),
@@ -179,5 +220,14 @@ class HtspExtractor : Extractor {
         const val TAG = "HtspExtractor"
         const val MAX_KEYFRAME_WAIT_US = 5_000_000L
         val SAMPLE_RATES = intArrayOf(96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350)
+        const val NONE = Long.MIN_VALUE
+        val METHOD = HtsFieldReader.name("method")
+        val STREAM = HtsFieldReader.name("stream")
+        val PTS = HtsFieldReader.name("pts")
+        val DTS = HtsFieldReader.name("dts")
+        val FRAMETYPE = HtsFieldReader.name("frametype")
+        val PAYLOAD = HtsFieldReader.name("payload")
+
+        fun isVideo(codec: String) = codec == "H264" || codec == "HEVC" || codec == "MPEG2VIDEO"
     }
 }

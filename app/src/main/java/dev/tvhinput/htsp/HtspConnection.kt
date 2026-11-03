@@ -25,8 +25,12 @@ import kotlin.concurrent.thread
 class HtspConnection private constructor(private val socket: Socket) : Closeable {
 
     interface SubscriptionListener {
-        /** Called on the reader thread with the decoded message and its raw body. */
-        fun onMessage(msg: HtsMsg, body: ByteArray)
+        /**
+         * Called on the reader thread with the message's method and its encoded body, which is the
+         * first [length] bytes of [body]. The listener owns [body] (a [BufferPool] buffer) and
+         * should [BufferPool.recycle] it once done.
+         */
+        fun onMessage(method: String, body: ByteArray, length: Int)
 
         fun onConnectionLost(error: IOException)
     }
@@ -106,19 +110,33 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
     }
 
     private fun readLoop() {
+        val fields = HtsFieldReader()
         try {
             while (!isClosed) {
                 val length = input.readInt()
                 if (length < 0 || length > MAX_MESSAGE) throw IOException("Bad HTSP message length $length")
-                val body = ByteArray(length)
-                input.readFully(body)
-                val msg = HtsMsg.deserialize(body)
-                val replyTo = msg.int("seq")
-                if (replyTo != null) {
-                    pending[replyTo]?.complete(msg)
+                val body = BufferPool.obtain(length)
+                input.readFully(body, 0, length)
+                // Only look at the routing fields: subscription messages are decoded by their consumer.
+                var replyTo = NONE
+                var subscriptionId = NONE
+                var method: String? = null
+                fields.reset(body, 0, length)
+                while (fields.next()) {
+                    when {
+                        fields.nameIs(SEQ) -> replyTo = fields.long()
+                        fields.nameIs(SUBSCRIPTION_ID) -> subscriptionId = fields.long()
+                        fields.nameIs(METHOD) -> method = fields.method()
+                    }
+                }
+                if (replyTo != NONE) {
+                    pending[replyTo.toInt()]?.complete(HtsMsg.deserialize(body, 0, length)) // copies its values
+                    BufferPool.recycle(body)
                     continue
                 }
-                msg.int("subscriptionId")?.let { subscriptions[it]?.onMessage(msg, body) }
+                val listener = if (subscriptionId != NONE) subscriptions[subscriptionId.toInt()] else null
+                if (listener != null && method != null) listener.onMessage(method, body, length)
+                else BufferPool.recycle(body)
             }
         } catch (e: IOException) {
             fail(e)
@@ -149,6 +167,10 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
         private const val TAG = "HtspConnection"
         private const val HTSP_VERSION = 34
         private const val MAX_MESSAGE = 32 * 1024 * 1024
+        private const val NONE = Long.MIN_VALUE
+        private val SEQ = HtsFieldReader.name("seq")
+        private val SUBSCRIPTION_ID = HtsFieldReader.name("subscriptionId")
+        private val METHOD = HtsFieldReader.name("method")
 
         /** Opens a connection, says hello and authenticates when a username is configured. */
         fun connect(config: TvhConfig): HtspConnection {
