@@ -1,8 +1,12 @@
 package dev.tvhinput
 
 import android.content.Context
+import androidx.core.content.edit
 
-/** How live streams are fetched. Channel and EPG sync always use the HTTP API. */
+/**
+ * How live streams are fetched. Independent of how channels and the guide are synced: over HTSP
+ * whenever the server allows it, the HTTP API otherwise (see TvProviderSync).
+ */
 enum class StreamProtocol { HTTP, HTSP }
 
 data class TvhConfig(
@@ -25,7 +29,10 @@ object Settings {
         val host = p.getString("host", null)?.takeIf { it.isNotBlank() } ?: return null
         // Older versions stored the password in plain text: move it to the encrypted field.
         p.getString("password", null)?.let { legacy ->
-            p.edit().putString("password_enc", SecretBox.encrypt(legacy)).remove("password").apply()
+            p.edit {
+                putString("password_enc", SecretBox.encrypt(legacy))
+                remove("password")
+            }
             return load(context)
         }
         return TvhConfig(
@@ -43,17 +50,17 @@ object Settings {
     }
 
     fun save(context: Context, config: TvhConfig) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            .putString("host", config.host)
-            .putInt("port", config.port)
-            .putBoolean("https", config.https)
-            .putString("web_root", config.webRoot)
-            .putString("username", config.username)
-            .putString("password_enc", SecretBox.encrypt(config.password))
-            .remove("password")
-            .putString("profile", config.profile)
-            .putString("protocol", config.protocol.name)
-            .putInt("htsp_port", config.htspPort)
-            .apply()
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit {
+            putString("host", config.host)
+            putInt("port", config.port)
+            putBoolean("https", config.https)
+            putString("web_root", config.webRoot)
+            putString("username", config.username)
+            putString("password_enc", SecretBox.encrypt(config.password))
+            remove("password")
+            putString("profile", config.profile)
+            putString("protocol", config.protocol.name)
+            putInt("htsp_port", config.htspPort)
+        }
     }
 }

@@ -34,6 +34,9 @@ class HtspExtractor(
     private class Track(val output: TrackOutput, val codec: String, var format: Format) {
         val video = isVideo(codec)
         val name = "Stream ${format.id} ($codec)"
+        val gaps = TimestampGaps(name)
+
+        // What reads this stream's frames, by kind.
         val audio = if (MimeTypes.isAudio(format.sampleMimeType)) {
             AudioFrameReader(if (codec == "MPEG4AUDIO") "AAC" else codec, name)
         } else null
@@ -41,14 +44,6 @@ class HtspExtractor(
         var latm: LatmAudio? = null
         val aspect = if (video) VideoAspectReader(codec, name) else null
         val text = if (codec == "TEXTSUB") TextSubtitles() else null
-        val gaps = TimestampGaps(name)
-
-        /** Declares [newFormat] if it differs from the current one (Media3 then adapts the decoder). */
-        fun update(newFormat: Format) {
-            if (newFormat === format) return
-            format = newFormat
-            output.format(newFormat)
-        }
 
         // A video picture whose data is written but not yet committed, in case the next packet
         // is its second field (see onPacket).
@@ -65,6 +60,13 @@ class HtspExtractor(
         var formatPending = false
         var sps: ByteArray? = null
         var pps: ByteArray? = null
+
+        /** Declares [newFormat] if it differs from the current one (Media3 then adapts the decoder). */
+        fun update(newFormat: Format) {
+            if (newFormat === format) return
+            format = newFormat
+            output.format(newFormat)
+        }
     }
 
     private lateinit var extractorOutput: ExtractorOutput

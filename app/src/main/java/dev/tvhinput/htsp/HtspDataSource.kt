@@ -40,7 +40,8 @@ class HtspDataSource(
     @Volatile private var streamsSignature: List<String>? = null
 
     private val queue = LinkedBlockingQueue<Any>()
-    private var connection: HtspConnection? = null
+    /** Set on the loading thread, also read on the connection's reader thread (onMessage). */
+    @Volatile private var connection: HtspConnection? = null
     private var subscriptionId = 0
     private var uri: Uri? = null
     private var opened = false
@@ -50,8 +51,10 @@ class HtspDataSource(
     private var chunk: Chunk? = null
     /** Read position in [chunk]: -4..-1 while emitting its length header, then the body offset. */
     private var chunkPos = 0
+    // Stall detection. lastMessageNs and receivedPacket are written by the reader thread and read by
+    // the loading thread; lastMessageCount and health belong to the reader thread, probedFor to the
+    // loading thread. open() resets them before subscribing.
     @Volatile private var lastMessageNs = 0L
-    // Only touched on the reader thread, after open() set them up.
     @Volatile private var receivedPacket = false
     private var lastMessageCount = 0L
     /** [lastMessageNs] of the stall last probed, so each stall is probed once. */
@@ -128,6 +131,8 @@ class HtspDataSource(
         queue.clear()
         streamsSignature = null
         receivedPacket = false
+        lastMessageCount = 0
+        probedFor = 0
         health = StreamHealth("channel $channelId")
         lastMessageNs = System.nanoTime() // tuning can take a few seconds before the first message
         val c = connections()

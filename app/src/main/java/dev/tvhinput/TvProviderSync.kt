@@ -8,6 +8,7 @@ import android.media.tv.TvContentRating
 import android.media.tv.TvContract
 import android.media.tv.TvContract.Programs.Genres
 import android.util.Log
+import androidx.core.content.edit
 import java.io.IOException
 import java.security.MessageDigest
 
@@ -29,7 +30,7 @@ class TvProviderSync(private val context: Context, private val client: TvhClient
     }
 
     /** Syncs the channel list and returns tvheadend channel uuid -> TvProvider channel id. */
-    fun syncChannels(snapshot: GuideSnapshot): Map<String, Long> {
+    fun syncChannels(snapshot: GuideSnapshot): Map<String, Long> = synchronized(WRITE_LOCK) {
         val radio = radioChannels(snapshot)
         val existing = existingChannels()
         val result = LinkedHashMap<String, Long>()
@@ -51,7 +52,7 @@ class TvProviderSync(private val context: Context, private val client: TvhClient
         }
 
         for (channel in snapshot.channels) result[channel.uuid]?.let { syncLogo(channel, it) }
-        return result
+        result
     }
 
     /**
@@ -59,7 +60,7 @@ class TvProviderSync(private val context: Context, private val client: TvhClient
      * so TV apps never see an empty guide while a sync runs. Programs whose content is unchanged
      * are left alone. Returns the number of programs.
      */
-    fun syncPrograms(events: List<TvhEvent>, channelIds: Map<String, Long>): Int {
+    fun syncPrograms(events: List<TvhEvent>, channelIds: Map<String, Long>): Int = synchronized(WRITE_LOCK) {
         val byChannel = events.groupBy { it.channelUuid }
         var count = 0
         var written = 0
@@ -82,7 +83,7 @@ class TvProviderSync(private val context: Context, private val client: TvhClient
             written += ops.size
         }
         Log.i(TAG, "Guide: $count programs, $written written")
-        return count
+        count
     }
 
     fun syncAll(): Int {
@@ -92,7 +93,7 @@ class TvProviderSync(private val context: Context, private val client: TvhClient
 
     fun deleteChannel(uuid: String, id: Long) {
         resolver.delete(TvContract.buildChannelUri(id), null, null)
-        logoCache.edit().remove(uuid).apply()
+        logoCache.edit { remove(uuid) }
     }
 
     fun existingChannels(): Map<String, Long> {
@@ -161,7 +162,7 @@ class TvProviderSync(private val context: Context, private val client: TvhClient
             if (logoCache.getString(channel.uuid, null) == url.toString()) return
             val bytes = client.download(url)
             resolver.openOutputStream(TvContract.buildChannelLogoUri(id))?.use { it.write(bytes) }
-            logoCache.edit().putString(channel.uuid, url.toString()).apply()
+            logoCache.edit { putString(channel.uuid, url.toString()) }
         } catch (e: Exception) {
             Log.w(TAG, "Logo download failed for ${channel.name}: ${e.message}")
         }
@@ -210,6 +211,13 @@ class TvProviderSync(private val context: Context, private val client: TvhClient
         private const val TAG = "TvProviderSync"
         private const val BATCH_SIZE = 500
 
+        /**
+         * Full syncs compare what's stored with what tvheadend has, then insert what's missing: two
+         * at once (the setup screen, the live guide monitor, the periodic worker) would both insert
+         * every new channel and program. They share the process, so one lock keeps them in turn.
+         */
+        private val WRITE_LOCK = Any()
+
         fun serviceType(radio: Boolean) =
             if (radio) TvContract.Channels.SERVICE_TYPE_AUDIO else TvContract.Channels.SERVICE_TYPE_AUDIO_VIDEO
 
@@ -242,7 +250,7 @@ object RadioChannels {
     fun add(context: Context, uuid: String) = replace(context, load(context) + uuid)
 
     fun replace(context: Context, uuids: Set<String>) {
-        prefs(context).edit().putStringSet(KEY, HashSet(uuids)).apply()
+        prefs(context).edit { putStringSet(KEY, HashSet(uuids)) }
     }
 
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)

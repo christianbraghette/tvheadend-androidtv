@@ -9,6 +9,7 @@ import dev.tvhinput.htsp.HtspConnection
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
@@ -41,20 +42,36 @@ class NeighbourPrewarmer(
      */
     fun update(currentUuid: String) {
         if (released) return
-        executor.execute {
+        post {
             idleDrop?.cancel(false)
             plan(currentUuid)
-            idleDrop = executor.schedule({
-                if (active.isNotEmpty()) Log.i(TAG, "No zapping for ${IDLE_DROP_MS / 1000} s: dropping pre-tunes")
-                dropAll()
-            }, IDLE_DROP_MS, TimeUnit.MILLISECONDS)
+            idleDrop = try {
+                executor.schedule({
+                    if (active.isNotEmpty()) Log.i(TAG, "No zapping for ${IDLE_DROP_MS / 1000} s: dropping pre-tunes")
+                    dropAll()
+                }, IDLE_DROP_MS, TimeUnit.MILLISECONDS)
+            } catch (_: RejectedExecutionException) {
+                null // released meanwhile: dropAll is queued already
+            }
         }
     }
 
     fun release() {
         released = true
-        executor.execute(::dropAll)
+        post(::dropAll)
         executor.shutdown()
+    }
+
+    /**
+     * Runs [block] on the executor, or not at all once released. Also used from the HTSP reader
+     * thread, where a RejectedExecutionException would be taken for a dead connection and close
+     * the session's own stream.
+     */
+    private fun post(block: () -> Unit) {
+        try {
+            executor.execute(block)
+        } catch (_: RejectedExecutionException) {
+        }
     }
 
     /** Ends one pre-tune; the next zap plans again (and may try it again). */
@@ -162,7 +179,7 @@ class NeighbourPrewarmer(
                 "subscriptionStart" -> {
                     val streams = HtsMsg.deserialize(body, 0, length).list("streams")
                         .mapNotNull { (it as? HtsMsg)?.long("index") }
-                    executor.execute { disableStreams(streams) }
+                    post { disableStreams(streams) }
                 }
                 "muxpkt" -> if (++packets == PACKETS_TO_LOG) {
                     Log.w(TAG, "${names[uuid] ?: uuid} still streaming after $packets packets: filter not supported?")
@@ -175,7 +192,7 @@ class NeighbourPrewarmer(
                         if (++noTuner == MAX_NO_TUNER) {
                             Log.i(TAG, "No free tuner for ${names[uuid] ?: uuid}: not pre-tuning it")
                             val id = subscriptionId
-                            executor.execute { giveUp(uuid, id) }
+                            post { giveUp(uuid, id) }
                         }
                     } else if (error != null && error != lastError) {
                         Log.i(TAG, "Pre-tune of ${names[uuid] ?: uuid}: $error")

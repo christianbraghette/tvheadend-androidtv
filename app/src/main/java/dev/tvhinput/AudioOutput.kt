@@ -2,6 +2,7 @@ package dev.tvhinput
 
 import android.content.Context
 import androidx.annotation.OptIn
+import androidx.core.content.edit
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.Format
@@ -33,7 +34,7 @@ class AudioOutput(private val context: Context) {
         set(value) {
             if (value == field) return
             field = value
-            prefs.edit().putBoolean(PREF_PASSTHROUGH, value).apply()
+            prefs.edit { putBoolean(PREF_PASSTHROUGH, value) }
         }
 
     val dualMono = DualMonoAudioProcessor()

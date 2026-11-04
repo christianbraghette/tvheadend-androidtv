@@ -41,7 +41,16 @@ class GuideMonitor(private val context: Context) {
     private fun loop() {
         var retryMs = RETRY_MIN_MS
         while (running) {
-            val config = Settings.load(context) ?: return
+            // Not set up yet: the setup screen may run while this service lives, so wait for it.
+            val config = Settings.load(context)
+            if (config == null) {
+                try {
+                    Thread.sleep(RETRY_MIN_MS)
+                } catch (e: InterruptedException) {
+                    return
+                }
+                continue
+            }
             val client = TvhClient(config)
             val lost = CompletableFuture<IOException>()
             try {

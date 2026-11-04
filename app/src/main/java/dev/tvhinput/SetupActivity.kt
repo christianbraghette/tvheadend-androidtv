@@ -17,8 +17,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * Setup screen. The TV app opens it when the user adds this input, and again from its
- * channel source settings to change the server or force a resync (there is no launcher entry).
+ * Setup screen. The TV app opens it when the user adds this input, and again from its channel
+ * source settings to change the server or force a resync; Settings > Apps can open it too (it
+ * has a plain launcher entry, not a TV home screen one: see the manifest).
  */
 class SetupActivity : ComponentActivity() {
     private lateinit var state: SetupState

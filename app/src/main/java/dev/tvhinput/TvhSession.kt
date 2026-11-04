@@ -17,6 +17,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.Surface
@@ -109,24 +110,26 @@ class TvhSession(
                 }
         )
         .build()
-        .also {
-            it.addListener(this)
-            it.addAnalyticsListener(object : AnalyticsListener {
+        .also { player ->
+            player.addListener(this)
+            player.addAnalyticsListener(object : AnalyticsListener {
                 override fun onAudioPositionAdvancing(eventTime: AnalyticsListener.EventTime, playoutStartSystemTimeMs: Long) {
+                    // Events arrive posted: one from the channel before a zap must not count for the new one.
+                    if (eventTime.realtimeMs < playStartedMs) return
                     audioStarted = true
                     maybeReveal()
                 }
             })
             // Called on the playback thread for every frame about to be shown: the first one after
             // the sound started is timed against the audio clock, i.e. in sync.
-            it.setVideoFrameMetadataListener { _, _, _, _ ->
+            player.setVideoFrameMetadataListener { _, _, _, _ ->
                 if (audioStarted && !syncedFrameShown) {
                     syncedFrameShown = true
                     handler.post(::maybeReveal)
                 }
             }
             if (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
-                it.addAnalyticsListener(EventLogger(TAG))
+                player.addAnalyticsListener(EventLogger(TAG))
             }
         }
 
@@ -152,6 +155,8 @@ class TvhSession(
     @Volatile private var audioStarted = false
     @Volatile private var syncedFrameShown = false
     private var firstFrameRendered = false
+    /** When the current play() started (SystemClock.elapsedRealtime, like player event times). */
+    private var playStartedMs = 0L
     /** Shows the picture anyway if the sound never starts (silent stream, audio decoder trouble). */
     private val revealTimeout = Runnable {
         if (!revealed) Log.w(TAG, "Audio didn't start in time: showing the picture anyway")
@@ -186,10 +191,6 @@ class TvhSession(
             },
             ContextCompat.RECEIVER_NOT_EXPORTED, // still gets these system broadcasts
         )
-        // Left over from the per-channel buffer tuning that default buffering replaced.
-        for (name in listOf("tvh_unstable_channels", "tvh_start_buffer_htsp", "tvh_start_buffer_http")) {
-            context.deleteSharedPreferences(name)
-        }
     }
 
     override fun onTune(channelUri: Uri): Boolean {
@@ -281,6 +282,7 @@ class TvhSession(
     private fun play(uuid: String) {
         if (!started) return // blocked by parental controls: retries and restarts wait for the PIN
         playToken++
+        playStartedMs = SystemClock.elapsedRealtime()
         revealed = false
         audioStarted = false
         syncedFrameShown = false
@@ -313,14 +315,14 @@ class TvhSession(
      * playing without video and give the picture back when the app hands us a surface again.
      */
     private fun isSurfaceLost(error: PlaybackException): Boolean =
-        generateSequence<Throwable>(error) { it.cause }
-            .filterIsInstance<MediaCodec.CodecException>()
+        causes(error).filterIsInstance<MediaCodec.CodecException>()
             .any { it.message.orEmpty().contains("surface", ignoreCase = true) }
 
     private fun isSurfaceSwapTimeout(error: PlaybackException): Boolean =
-        generateSequence<Throwable>(error) { it.cause }
-            .filterIsInstance<ExoTimeoutException>()
+        causes(error).filterIsInstance<ExoTimeoutException>()
             .any { it.timeoutOperation == ExoTimeoutException.TIMEOUT_OPERATION_DETACH_SURFACE }
+
+    private fun causes(error: Throwable) = generateSequence(error) { it.cause }
 
     /** If the app never sends a new surface, the old one may still be fine: try it again. */
     private val restoreSurface = Runnable {
@@ -503,8 +505,10 @@ class TvhSession(
                 }
                 retries = 0
                 showStatus(null)
-                if (player.currentTracks.isTypeSelected(C.TRACK_TYPE_VIDEO)) {
-                    if (revealed) {
+                val tracks = player.currentTracks
+                val videoGroups = tracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }
+                when {
+                    tracks.isTypeSelected(C.TRACK_TYPE_VIDEO) -> if (revealed) {
                         notifyVideoAvailable() // back from a rebuffer
                     } else {
                         maybeReveal()
@@ -513,22 +517,23 @@ class TvhSession(
                             handler.postDelayed(revealTimeout, REVEAL_TIMEOUT_MS)
                         }
                     }
-                } else if (player.currentTracks.groups.any { it.type == C.TRACK_TYPE_VIDEO }) {
-                    val videoGroups = player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }
-                    if (videoGroups.none { g -> (0 until g.length).any(g::isTrackSupported) }) {
-                        // The stream has video, but no decoder on this device can play it (a codec or
-                        // profile the hardware lacks): say so instead of a silent black screen.
-                        val video = videoGroups.first().getTrackFormat(0)
-                        Log.w(TAG, "No decoder for the video: ${video.sampleMimeType} ${video.codecs ?: ""} ${video.width}x${video.height}")
-                        showStatus(context.getString(R.string.status_video_unsupported))
+                    videoGroups.isEmpty() -> {
+                        // No video track at all: a radio channel.
+                        notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_AUDIO_ONLY)
+                        val uuid = currentChannelUuid
+                        val uri = currentChannelUri
+                        if (uuid != null && uri != null) markRadio(uuid, uri)
                     }
-                    notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_UNKNOWN)
-                } else {
-                    // No video track at all: a radio channel.
-                    notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_AUDIO_ONLY)
-                    val uuid = currentChannelUuid
-                    val uri = currentChannelUri
-                    if (uuid != null && uri != null) markRadio(uuid, uri)
+                    else -> {
+                        if (videoGroups.none { g -> (0 until g.length).any(g::isTrackSupported) }) {
+                            // The stream has video, but no decoder on this device can play it (a codec
+                            // or profile the hardware lacks): say so instead of a silent black screen.
+                            val video = videoGroups.first().getTrackFormat(0)
+                            Log.w(TAG, "No decoder for the video: ${video.sampleMimeType} ${video.codecs ?: ""} ${video.width}x${video.height}")
+                            showStatus(context.getString(R.string.status_video_unsupported))
+                        }
+                        notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_UNKNOWN)
+                    }
                 }
             }
             Player.STATE_ENDED -> {
@@ -564,9 +569,7 @@ class TvhSession(
         }
         Log.w(TAG, "Playback error: ${error.errorCodeName}", error)
         // tvheadend answers an HTTP stream request it can't serve (no free tuner, ...) with 503.
-        val httpCode = generateSequence<Throwable>(error) { it.cause }
-            .filterIsInstance<HttpDataSource.InvalidResponseCodeException>()
-            .firstOrNull()?.responseCode
+        val httpCode = causes(error).filterIsInstance<HttpDataSource.InvalidResponseCodeException>().firstOrNull()?.responseCode
         if (httpCode == 503) onServerStatus("noFreeAdapter")
         else notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_UNKNOWN)
         if (retries++ < MAX_RETRIES) {
@@ -615,6 +618,7 @@ class TvhSession(
     private fun onDualMono(streamId: String?, dual: Boolean) {
         handler.post {
             val id = streamId ?: return@post
+            if (released) return@post // the extractor may still be reading when the session ends
             val streams = trackMenu.dualMonoStreams
             if (if (dual) streams.add(id) else streams.remove(id)) publishTracks()
         }
