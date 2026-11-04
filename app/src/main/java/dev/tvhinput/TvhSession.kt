@@ -12,7 +12,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.Surface
@@ -21,6 +20,7 @@ import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.annotation.OptIn
 import androidx.media3.common.C
+import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
@@ -30,10 +30,15 @@ import androidx.media3.common.text.CueGroup
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.DecoderReuseEvaluation
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.Renderer
+import androidx.media3.exoplayer.mediacodec.MediaCodecInfo
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.util.EventLogger
+import androidx.media3.exoplayer.video.MediaCodecVideoRenderer
+import androidx.media3.exoplayer.video.VideoRendererEventListener
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.extractor.ExtractorsFactory
@@ -76,44 +81,11 @@ class TvhSession(
 
     private val prewarmer = if (useHtsp) NeighbourPrewarmer(context, client, ::connectHtsp) else null
 
-    private val loadControl = LiveLoadControl()
-
-    // Per-channel start buffer, learned from how low the buffer gets while watching.
-    private val startBuffers = StartBufferTuner(
-        context.getSharedPreferences(if (useHtsp) "tvh_start_buffer_htsp" else "tvh_start_buffer_http", Context.MODE_PRIVATE),
-        // HTSP delivers clean, already-demuxed packets and needs less cushion than raw TS.
-        // Below ~1 s the video decoder can drain the buffer into its input queue and stall at start.
-        if (useHtsp) StartBufferTuner.Limits(defaultUs = 1_500_000L, minUs = 1_000_000L, maxUs = 5_000_000L)
-        else StartBufferTuner.Limits(defaultUs = 2_500_000L, minUs = 1_200_000L, maxUs = 6_000_000L),
-    )
-
-    /** What one uninterrupted playback of a channel has shown about its buffer needs. */
-    private class Watch(val uuid: String, val startBufferUs: Long) {
-        var readyAtMs = 0L
-        var bufferedAtStartUs = 0L
-        var minBufferedUs = Long.MAX_VALUE
-        var stalled = false
-        var reported = false
-    }
-
-    private var watch: Watch? = null
-
-    private val sampleBuffer = object : Runnable {
-        override fun run() {
-            val w = watch ?: return
-            if (w.stalled || w.reported || player.playbackState != Player.STATE_READY) return
-            w.minBufferedUs = minOf(w.minBufferedUs, player.totalBufferedDuration * 1000)
-            // Report once after a while, so a long viewing counts even if the app is killed later.
-            if (SystemClock.elapsedRealtime() - w.readyAtMs >= WATCH_REPORT_MS) finishWatch() else handler.postDelayed(this, BUFFER_SAMPLE_MS)
-        }
-    }
-
     // No tunneled playback: on the Chromecast it started audio up to ~2 s before the first picture
     // on most channels and failed on mono audio, with no measurable smoothness gain.
     private val player: ExoPlayer = ExoPlayer.Builder(context)
-        .setLoadControl(loadControl)
         .setRenderersFactory(
-            DefaultRenderersFactory(context).setEnableDecoderFallback(true)
+            FreshVideoDecoderRenderersFactory(context).setEnableDecoderFallback(true)
                 // Broadcast audio is often MP2/AC3; fall back to FFmpeg when the platform can't decode it.
                 .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
                 .setMediaCodecSelector { mime, secure, tunneling ->
@@ -144,12 +116,16 @@ class TvhSession(
     private var currentChannelUri: Uri? = null
     private var currentChannelUuid: String? = null
     private var retries = 0
-    private var playingSinceTune = false
+    /** Counts play() calls, so a delayed action can tell its playback was replaced. */
+    private var playToken = 0
+    private var prewarmedToken = -1
 
     init {
         setOverlayViewEnabled(true)
-        // Replaced by the learned per-channel start buffers.
-        context.deleteSharedPreferences("tvh_unstable_channels")
+        // Left over from the per-channel buffer tuning that default buffering replaced.
+        for (name in listOf("tvh_unstable_channels", "tvh_start_buffer_htsp", "tvh_start_buffer_http")) {
+            context.deleteSharedPreferences(name)
+        }
     }
 
     override fun onTune(channelUri: Uri): Boolean {
@@ -166,17 +142,6 @@ class TvhSession(
         return true
     }
 
-    /** Reports what the current playback showed, if it ran long enough to mean something. */
-    private fun finishWatch() {
-        val w = watch ?: return
-        handler.removeCallbacks(sampleBuffer)
-        if (w.stalled || w.reported || w.readyAtMs == 0L) return
-        w.reported = true
-        val watchedMs = SystemClock.elapsedRealtime() - w.readyAtMs
-        if (watchedMs < MIN_WATCH_MS) return
-        startBuffers.onWatched(w.uuid, w.startBufferUs, w.bufferedAtStartUs, w.minBufferedUs, watchedMs)
-    }
-
     /** Called on the loader thread when an HTSP subscription starts. */
     private fun connectHtsp(): HtspConnection = synchronized(htspLock) {
         if (released) throw IOException("Session released")
@@ -188,17 +153,9 @@ class TvhSession(
     }
 
     private fun play(uuid: String) {
-        // The initial buffering of a (re)start is not a stall: only count stalls after playback began.
-        playingSinceTune = false
-        finishWatch()
-        val startBufferUs = startBuffers.startBufferUs(uuid)
-        loadControl.startBufferUs = startBufferUs
-        // After a stall, resume with a bit more than the start cushion: a fixed 3 s turned a
-        // 0.2 s decoder hiccup into a 1.5 s freeze.
-        loadControl.rebufferUs = startBufferUs + REBUFFER_EXTRA_US
-        watch = Watch(uuid, startBufferUs)
+        playToken++
         val uri = if (useHtsp) "htsp://channel/${client.htspChannelId(uuid)}" else client.streamUrl(uuid)
-        Log.i(TAG, "Playing $uri (start buffer ${startBufferUs / 1000} ms)")
+        Log.i(TAG, "Playing $uri")
         val source = mediaSourceFactory.createMediaSource(MediaItem.fromUri(uri))
         player.setMediaSource(source)
         player.prepare()
@@ -330,7 +287,6 @@ class TvhSession(
     }
 
     override fun onRelease() {
-        finishWatch()
         handler.removeCallbacksAndMessages(null)
         player.removeListener(this)
         player.release()
@@ -352,24 +308,17 @@ class TvhSession(
             Player.STATE_BUFFERING -> {
                 handler.removeCallbacks(notifyBuffering)
                 handler.postDelayed(notifyBuffering, BUFFERING_NOTIFY_DELAY_MS)
-                val w = watch
-                // A stall counts even after a clean report: the channel needs more cushion either way.
-                if (playingSinceTune && w != null && !w.stalled) {
-                    w.stalled = true
-                    handler.removeCallbacks(sampleBuffer)
-                    startBuffers.onStall(w.uuid, w.startBufferUs)
-                }
             }
             Player.STATE_READY -> {
                 handler.removeCallbacks(notifyBuffering)
-                playingSinceTune = true
-                watch?.takeIf { it.readyAtMs == 0L }?.let {
-                    it.readyAtMs = SystemClock.elapsedRealtime()
-                    it.bufferedAtStartUs = player.totalBufferedDuration * 1000
-                    it.minBufferedUs = it.bufferedAtStartUs
-                    handler.postDelayed(sampleBuffer, BUFFER_SAMPLE_MS)
-                    // Once this channel plays, keep its neighbours tuned for the next zap.
-                    prewarmer?.let { p -> handler.postDelayed({ if (watch === it) p.update(it.uuid) }, PREWARM_DELAY_MS) }
+                // Once this channel plays, keep its neighbours tuned for the next zap.
+                if (prewarmedToken != playToken) {
+                    prewarmedToken = playToken
+                    val token = playToken
+                    val uuid = currentChannelUuid
+                    if (prewarmer != null && uuid != null) {
+                        handler.postDelayed({ if (token == playToken) prewarmer.update(uuid) }, PREWARM_DELAY_MS)
+                    }
                 }
                 retries = 0
                 showStatus(null)
@@ -455,16 +404,52 @@ class TvhSession(
         }
     }
 
+    /**
+     * Creates a new video decoder whenever the video format changes, i.e. on every zap, instead of
+     * flushing and reusing it. A reused Amlogic decoder got stuck in a "resolution changing" state
+     * after the first zap and logged ~40 errors/s for as long as the channel played.
+     */
+    private class FreshVideoDecoderRenderersFactory(context: Context) : DefaultRenderersFactory(context) {
+        override fun buildVideoRenderers(
+            context: Context,
+            extensionRendererMode: Int,
+            mediaCodecSelector: MediaCodecSelector,
+            enableDecoderFallback: Boolean,
+            eventHandler: Handler,
+            eventListener: VideoRendererEventListener,
+            allowedVideoJoiningTimeMs: Long,
+            out: ArrayList<Renderer>,
+        ) {
+            super.buildVideoRenderers(
+                context, extensionRendererMode, mediaCodecSelector, enableDecoderFallback,
+                eventHandler, eventListener, allowedVideoJoiningTimeMs, out,
+            )
+            val index = out.indexOfFirst { it is MediaCodecVideoRenderer }
+            if (index < 0) return
+            val builder = MediaCodecVideoRenderer.Builder(context)
+                .setCodecAdapterFactory(codecAdapterFactory)
+                .setMediaCodecSelector(mediaCodecSelector)
+                .setAllowedJoiningTimeMs(allowedVideoJoiningTimeMs)
+                .setEnableDecoderFallback(enableDecoderFallback)
+                .setEventHandler(eventHandler)
+                .setEventListener(eventListener)
+                .setMaxDroppedFramesToNotify(MAX_DROPPED_VIDEO_FRAME_COUNT_TO_NOTIFY)
+            out[index] = object : MediaCodecVideoRenderer(builder) {
+                override fun canReuseCodec(codecInfo: MediaCodecInfo, oldFormat: Format, newFormat: Format) =
+                    DecoderReuseEvaluation(
+                        codecInfo.name, oldFormat, newFormat,
+                        DecoderReuseEvaluation.REUSE_RESULT_NO, DecoderReuseEvaluation.DISCARD_REASON_APP_OVERRIDE,
+                    )
+            }
+        }
+    }
+
     private companion object {
         const val TAG = "TvhSession"
         const val MAX_RETRIES = 3
         const val RETRY_DELAY_MS = 2000L
         const val BUFFERING_NOTIFY_DELAY_MS = 1000L
-        const val BUFFER_SAMPLE_MS = 250L
-        const val REBUFFER_EXTRA_US = 1_000_000L
         const val PREWARM_DELAY_MS = 2000L
-        const val MIN_WATCH_MS = 15_000L
-        const val WATCH_REPORT_MS = 60_000L
 
         // These reasons exist from Android 11; older TV apps get the generic one.
         val REASON_INSUFFICIENT_RESOURCE =

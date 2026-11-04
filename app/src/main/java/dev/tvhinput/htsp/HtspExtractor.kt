@@ -15,6 +15,7 @@ import androidx.media3.extractor.SeekMap
 import androidx.media3.extractor.TrackOutput
 import androidx.media3.extractor.text.SubtitleParser
 import androidx.media3.extractor.text.SubtitleTranscodingExtractorOutput
+import kotlin.math.abs
 
 /**
  * Reads the htsmsg frames produced by [HtspDataSource]: `subscriptionStart` declares the
@@ -26,15 +27,20 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
     private class Track(val output: TrackOutput, val codec: String, var format: Format) {
         val video = isVideo(codec)
         val aac = codec == "AAC"
+
+        // A video picture whose data is written but not yet committed, in case the next packet
+        // is its second field (see onPacket).
+        var pendingSize = 0
+        var pendingTimeUs = 0L
+        var pendingDtsUs = 0L
+        var pendingDurationUs = 0L
+        var pendingKeyFrame = false
     }
 
     private lateinit var extractorOutput: ExtractorOutput
     private val tracks = HashMap<Int, Track>()
     private var started = false
     private var baseTimeUs = C.TIME_UNSET
-    private var firstSeenUs = C.TIME_UNSET
-    private var hasVideo = false
-    private var droppedBeforeStart = 0
     private val header = ByteArray(4)
     private var body = ByteArray(64 * 1024)
     private val fields = HtsFieldReader()
@@ -61,6 +67,7 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
         var pts = NONE
         var dts = NONE
         var frameType = 0
+        var duration = 0L
         var payloadOffset = -1
         var payloadLength = 0
         fields.reset(body, 0, length)
@@ -71,6 +78,7 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
                 fields.nameIs(PTS) -> pts = fields.long()
                 fields.nameIs(DTS) -> dts = fields.long()
                 fields.nameIs(FRAMETYPE) -> frameType = fields.long().toInt()
+                fields.nameIs(DURATION) -> duration = fields.long()
                 fields.nameIs(PAYLOAD) -> {
                     payloadOffset = fields.dataOffset
                     payloadLength = fields.dataLength
@@ -82,7 +90,7 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
             "muxpkt" -> {
                 val timestamp = if (pts != NONE) pts else dts
                 if (timestamp != NONE && payloadOffset >= 0) {
-                    onPacket(stream, timestamp, frameType, payloadOffset, payloadLength)
+                    onPacket(stream, timestamp, if (dts != NONE) dts else timestamp, duration, frameType, payloadOffset, payloadLength)
                 }
             }
         }
@@ -100,7 +108,6 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
             val output = extractorOutput.track(index, MimeTypes.getTrackType(format.sampleMimeType))
             output.format(format)
             tracks[index] = Track(output, codec, format)
-            if (isVideo(codec)) hasVideo = true
             val video = if (isVideo(codec)) {
                 " ${format.width}x${format.height} aspect=${stream.int("aspect_num")}:${stream.int("aspect_den")} par=${format.pixelWidthHeightRatio}"
             } else ""
@@ -111,26 +118,14 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
         started = true
     }
 
-    /** One muxpkt; its payload is `body[offset, offset + size)`. */
-    private fun onPacket(stream: Int, timestamp: Long, frameType: Int, offset: Int, size: Int) {
+    /** One muxpkt; its payload is `body[offset, offset + size)`. Times are in µs. */
+    private fun onPacket(stream: Int, timestamp: Long, dts: Long, duration: Long, frameType: Int, offset: Int, size: Int) {
         val track = tracks[stream] ?: return
-        val video = track.video
-        val keyFrame = !video || frameType == 'I'.code
+        val keyFrame = !track.video || frameType == 'I'.code
 
-        // A subscription starts mid-GOP: audio would play over a black screen until the next video
-        // keyframe. Start the timeline at that keyframe and drop everything before it instead.
-        if (baseTimeUs == C.TIME_UNSET) {
-            if (firstSeenUs == C.TIME_UNSET) firstSeenUs = timestamp
-            // ...but don't wait forever: a scrambled or broken video stream must not mute the audio.
-            val waitedTooLong = timestamp - firstSeenUs > MAX_KEYFRAME_WAIT_US
-            if (hasVideo && !(video && keyFrame) && !waitedTooLong) {
-                droppedBeforeStart++
-                return
-            }
-            baseTimeUs = timestamp
-            Log.i(TAG, "Starting at first ${if (video) "keyframe" else "packet"}, dropped $droppedBeforeStart packets")
-        }
-        if (timestamp < baseTimeUs) return
+        // Every packet is passed through as it arrives; the player's sample queue itself skips
+        // video until the first keyframe.
+        if (baseTimeUs == C.TIME_UNSET) baseTimeUs = timestamp
 
         var start = offset
         if (track.aac) {
@@ -139,12 +134,42 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
             start += skip
         }
         val sampleSize = offset + size - start
-
-        val flags = if (keyFrame) C.BUFFER_FLAG_KEY_FRAME else 0
         sample.reset(body, start + sampleSize)
         sample.setPosition(start)
+
+        if (!track.video) {
+            track.output.sampleData(sample, sampleSize)
+            track.output.sampleMetadata(timestamp - baseTimeUs, if (keyFrame) C.BUFFER_FLAG_KEY_FRAME else 0, sampleSize, 0, null)
+            return
+        }
+
+        // Field-coded interlaced video (H.264 PAFF, e.g. Italian channel 6) arrives as one packet
+        // per field, half a frame apart. Fed to the decoder one field at a time, the Chromecast
+        // dropped ~3 frames/s; the TS path hands it whole frames and plays smoothly. So join a
+        // field to the one before it: decode times half a frame duration apart. An I field always
+        // starts a new frame (unless it follows another I field), which realigns the pairing.
+        val secondField = track.pendingSize > 0 && track.pendingDurationUs > 0 &&
+            (!keyFrame || track.pendingKeyFrame) &&
+            abs((dts - track.pendingDtsUs) * 2 - track.pendingDurationUs) <= FIELD_TOLERANCE_US
+        if (!secondField) commitPending(track)
         track.output.sampleData(sample, sampleSize)
-        track.output.sampleMetadata(timestamp - baseTimeUs, flags, sampleSize, 0, null)
+        if (secondField) {
+            track.pendingSize += sampleSize
+            commitPending(track)
+        } else {
+            track.pendingSize = sampleSize
+            track.pendingTimeUs = timestamp - baseTimeUs
+            track.pendingDtsUs = dts
+            track.pendingDurationUs = duration
+            track.pendingKeyFrame = keyFrame
+        }
+    }
+
+    private fun commitPending(track: Track) {
+        if (track.pendingSize == 0) return
+        val flags = if (track.pendingKeyFrame) C.BUFFER_FLAG_KEY_FRAME else 0
+        track.output.sampleMetadata(track.pendingTimeUs, flags, track.pendingSize, 0, null)
+        track.pendingSize = 0
     }
 
     /**
@@ -235,15 +260,16 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
 
     private companion object {
         const val TAG = "HtspExtractor"
-        const val MAX_KEYFRAME_WAIT_US = 5_000_000L
         val SAMPLE_RATES = intArrayOf(96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350)
         const val NONE = Long.MIN_VALUE
+        const val FIELD_TOLERANCE_US = 2L // 90 kHz -> µs rounding
         val METHOD = HtsFieldReader.name("method")
         val STREAM = HtsFieldReader.name("stream")
         val PTS = HtsFieldReader.name("pts")
         val DTS = HtsFieldReader.name("dts")
         val FRAMETYPE = HtsFieldReader.name("frametype")
         val PAYLOAD = HtsFieldReader.name("payload")
+        val DURATION = HtsFieldReader.name("duration")
 
         fun isVideo(codec: String) = codec == "H264" || codec == "HEVC" || codec == "MPEG2VIDEO"
     }
