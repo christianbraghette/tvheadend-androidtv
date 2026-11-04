@@ -513,14 +513,22 @@ class TvhSession(
                             handler.postDelayed(revealTimeout, REVEAL_TIMEOUT_MS)
                         }
                     }
+                } else if (player.currentTracks.groups.any { it.type == C.TRACK_TYPE_VIDEO }) {
+                    val videoGroups = player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }
+                    if (videoGroups.none { g -> (0 until g.length).any(g::isTrackSupported) }) {
+                        // The stream has video, but no decoder on this device can play it (a codec or
+                        // profile the hardware lacks): say so instead of a silent black screen.
+                        val video = videoGroups.first().getTrackFormat(0)
+                        Log.w(TAG, "No decoder for the video: ${video.sampleMimeType} ${video.codecs ?: ""} ${video.width}x${video.height}")
+                        showStatus(context.getString(R.string.status_video_unsupported))
+                    }
+                    notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_UNKNOWN)
                 } else {
+                    // No video track at all: a radio channel.
                     notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_AUDIO_ONLY)
                     val uuid = currentChannelUuid
                     val uri = currentChannelUri
-                    // Only a stream without any video track is radio, not one whose video can't be decoded.
-                    if (uuid != null && uri != null && player.currentTracks.groups.none { it.type == C.TRACK_TYPE_VIDEO }) {
-                        markRadio(uuid, uri)
-                    }
+                    if (uuid != null && uri != null) markRadio(uuid, uri)
                 }
             }
             Player.STATE_ENDED -> {

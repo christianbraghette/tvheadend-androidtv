@@ -28,6 +28,7 @@
     <string name="status_user_limit">Streaming limit reached on the server</string>
     <string name="status_other">Channel unavailable (%1$s)</string>
     <string name="status_failed">Channel unavailable</string>
+    <string name="status_video_unsupported">This device can\'t play this channel\'s video format</string>
     <!-- Audio menu entry for the second programme of a "dual mono" broadcast (e.g. original language). -->
     <string name="audio_dual_mono_second">Audio 2</string>
     <!-- Audio menu: Dolby sent undecoded to the TV/receiver ("Italiano · Dolby Digital (passthrough)"). -->

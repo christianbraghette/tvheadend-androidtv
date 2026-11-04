@@ -8,7 +8,7 @@ import androidx.media3.container.NalUnitUtil
 import kotlin.math.abs
 
 /**
- * Follows the picture shape a video stream signals in-band (H.264 SPS, MPEG-2 sequence header),
+ * Follows the picture shape a video stream signals in-band (H.264/H.265 SPS, MPEG-2 sequence header),
  * read at each keyframe. tvheadend only reports it when the subscription starts, so a channel
  * switching between 4:3 and 16:9 (or SD and HD) mid-programme kept the shape it had at tune-in.
  *
@@ -28,21 +28,26 @@ internal class VideoAspectReader(private val codec: String, private val name: St
 
     /** The format from the keyframe at `data[offset, offset + size)` on: [format] itself unless the picture changed. */
     fun read(format: Format, data: ByteArray, offset: Int, size: Int): Format = when (codec) {
-        "H264" -> readH264(format, data, offset, size)
+        "H264" -> readSps(format, data, offset, size, hevc = false)
+        "HEVC" -> readSps(format, data, offset, size, hevc = true)
         "MPEG2VIDEO" -> readMpeg2(format, data, offset, size)
-        else -> format // HEVC: not followed
+        else -> format
     }
 
-    private fun readH264(format: Format, data: ByteArray, offset: Int, size: Int): Format {
+    private fun readSps(format: Format, data: ByteArray, offset: Int, size: Int, hevc: Boolean): Format {
         var result = format
-        StartCodes.forEachH264Nal(data, offset, size) { start, end, type ->
-            if (type != NAL_SPS) return@forEachH264Nal true
+        val spsType = if (hevc) NalUnitUtil.H265_NAL_UNIT_TYPE_SPS else NAL_SPS
+        StartCodes.forEachNal(data, offset, size, hevc) { start, end, type ->
+            if (type != spsType) return@forEachNal true
             val sps = data.copyOfRange(start, end)
             if (!sps.contentEquals(lastSps)) {
                 lastSps = sps
-                runCatching { NalUnitUtil.parseSpsNalUnit(sps, 3, sps.size) }.getOrNull()?.let {
-                    result = withPicture(format, it.pixelWidthHeightRatio, it.width, it.height)
-                }
+                // Offset 3: after the start code, at the NAL unit header.
+                val picture = runCatching {
+                    if (hevc) NalUnitUtil.parseH265SpsNalUnit(sps, 3, sps.size, null).let { Triple(it.pixelWidthHeightRatio, it.width, it.height) }
+                    else NalUnitUtil.parseSpsNalUnit(sps, 3, sps.size).let { Triple(it.pixelWidthHeightRatio, it.width, it.height) }
+                }.getOrNull()
+                if (picture != null) result = withPicture(format, picture.first, picture.second, picture.third)
             }
             false
         }

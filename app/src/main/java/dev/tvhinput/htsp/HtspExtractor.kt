@@ -34,7 +34,11 @@ class HtspExtractor(
     private class Track(val output: TrackOutput, val codec: String, var format: Format) {
         val video = isVideo(codec)
         val name = "Stream ${format.id} ($codec)"
-        val audio = if (MimeTypes.isAudio(format.sampleMimeType)) AudioFrameReader(codec, name) else null
+        val audio = if (MimeTypes.isAudio(format.sampleMimeType)) {
+            AudioFrameReader(if (codec == "MPEG4AUDIO") "AAC" else codec, name)
+        } else null
+        /** "MPEG4AUDIO" whose packets turned out to be LATM, not ADTS (see onPacket). */
+        var latm: LatmAudio? = null
         val aspect = if (video) VideoAspectReader(codec, name) else null
         val text = if (codec == "TEXTSUB") TextSubtitles() else null
         val gaps = TimestampGaps(name)
@@ -172,6 +176,16 @@ class HtspExtractor(
         }
         if (baseTimeUs == C.TIME_UNSET) baseTimeUs = timestamp
 
+        if (track.codec == "MPEG4AUDIO") {
+            if (track.latm == null && LatmAudio.isLoas(body, offset, size)) {
+                Log.i(TAG, "${track.name} is LATM: unpacking it to AAC")
+                track.latm = LatmAudio(track.output, track.format)
+            }
+            track.latm?.let {
+                it.consume(body, offset, size, timestamp - baseTimeUs)
+                return
+            }
+        }
         val audio = track.audio
         if (audio != null) {
             val wasDualMono = audio.dualMono
@@ -242,7 +256,7 @@ class HtspExtractor(
 
     /** Keeps the latest SPS and PPS (with a 3-byte start code, as Media3 expects) from `body[offset, offset + size)`. */
     private fun collectParameterSets(track: Track, offset: Int, size: Int) {
-        StartCodes.forEachH264Nal(body, offset, size) { start, end, type ->
+        StartCodes.forEachNal(body, offset, size) { start, end, type ->
             when (type) {
                 NAL_SPS -> track.sps = body.copyOfRange(start, end)
                 NAL_PPS -> track.pps = body.copyOfRange(start, end)
@@ -302,7 +316,8 @@ class HtspExtractor(
             "MPEG2AUDIO" -> builder.setSampleMimeType(MimeTypes.AUDIO_MPEG_L2)
             "AC3" -> builder.setSampleMimeType(MimeTypes.AUDIO_AC3)
             "EAC3" -> builder.setSampleMimeType(MimeTypes.AUDIO_E_AC3)
-            "AAC" -> builder.setSampleMimeType(MimeTypes.AUDIO_AAC)
+            // AAC comes ADTS-framed; "MPEG4AUDIO" may be LATM instead (handled by LatmAudio).
+            "AAC", "MPEG4AUDIO" -> builder.setSampleMimeType(MimeTypes.AUDIO_AAC)
                 .setInitializationData(listOf(AudioFrameReader.audioSpecificConfig(2, rateIndex, channels)))
             "DVBSUB" -> {
                 val composition = stream.int("composition_id") ?: 0

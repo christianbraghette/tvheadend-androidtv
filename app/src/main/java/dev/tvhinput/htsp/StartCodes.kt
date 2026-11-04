@@ -21,17 +21,25 @@ internal object StartCodes {
     }
 
     /**
-     * Calls [block] with each H.264 NAL unit in `data[offset, offset + size)`: its start (at the
-     * 3-byte start code), its end and its type. Stops early when [block] returns false.
+     * Calls [block] with each NAL unit in `data[offset, offset + size)`: its start (at the 3-byte
+     * start code), its end and its type (H.264 or, with [hevc], H.265 numbering). Stops early when
+     * [block] returns false.
      */
-    inline fun forEachH264Nal(data: ByteArray, offset: Int, size: Int, block: (start: Int, end: Int, type: Int) -> Boolean) {
+    inline fun forEachNal(
+        data: ByteArray, offset: Int, size: Int, hevc: Boolean = false,
+        block: (start: Int, end: Int, type: Int) -> Boolean,
+    ) {
         val limit = offset + size
         var i = find(data, offset, limit)
         while (i < limit) {
             val payload = i + 3
             val next = find(data, payload, limit)
             val end = unitEnd(data, payload, next)
-            if (end > payload && !block(i, end, data[payload].toInt() and 0x1f)) return
+            if (end > payload) {
+                val header = data[payload].toInt()
+                val type = if (hevc) (header shr 1) and 0x3f else header and 0x1f
+                if (!block(i, end, type)) return
+            }
             i = next
         }
     }
