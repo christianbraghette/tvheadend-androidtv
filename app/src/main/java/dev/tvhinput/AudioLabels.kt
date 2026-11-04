@@ -11,14 +11,15 @@ import java.util.Locale
  *
  * - Broadcasters leave some tracks without a language ("und": Rai's Dolby and audio-description
  *   tracks). Those get the channel's main language, i.e. that of its first tagged track.
- * - The first track of each language shows just the language. Further tracks of the same
- *   language get "<Language> · <what it is>": "Italiano · Dolby Digital", "Italiano · Mono".
+ * - TV apps show the channel layout themselves (MochiMochi: "italiano · Mono"), not the codec.
+ *   So a further track of a language that already has one gets a description only when that
+ *   alone wouldn't tell them apart: "italiano · Dolby Digital" for Dolby, a number otherwise.
  */
 @OptIn(UnstableApi::class)
 object AudioLabels {
 
     /** Words for the labels, from the app's resources (fixed ones in tests). */
-    class Words(val mono: String, val passthrough: String)
+    class Words(val passthrough: String)
 
     class Track(val language: String?, val mimeType: String?, val channelCount: Int)
 
@@ -27,15 +28,20 @@ object AudioLabels {
     fun label(tracks: List<Track>, words: Words): List<Label> {
         val main = tracks.firstNotNullOfOrNull { defined(it.language) }
         val languages = tracks.map { defined(it.language) ?: main }
+        // What the TV app shows for an entry without a description: language and layout.
+        val shown = HashSet<Pair<String?, Int>>()
         val used = HashSet<String>()
         return tracks.mapIndexed { i, track ->
             val language = languages[i]
             val first = languages.indexOf(language) == i
-            val description = if (first) null else {
-                var text = listOfNotNull(displayName(language), kind(track, words) ?: "${i + 1}").joinToString(" · ")
-                if (!used.add(text)) text += " (${i + 1})"
-                text
-            }
+            val dolby = isDolby(track.mimeType)
+            val description = when {
+                first && !dolby -> null.also { shown += language to track.channelCount }
+                dolby && !first -> listOfNotNull(displayName(language), dolbyName(track)).joinToString(" · ")
+                dolby -> null.also { shown += language to track.channelCount } // the channel's main track
+                shown.add(language to track.channelCount) -> null // the layout tells it apart
+                else -> listOfNotNull(displayName(language), "${i + 1}").joinToString(" · ")
+            }?.let { if (used.add(it)) it else "$it (${i + 1})" }
             Label(language, description)
         }
     }
@@ -46,14 +52,6 @@ object AudioLabels {
 
     fun isDolby(mimeType: String?) =
         mimeType == MimeTypes.AUDIO_AC3 || mimeType == MimeTypes.AUDIO_E_AC3 || mimeType == MimeTypes.AUDIO_E_AC3_JOC
-
-    private fun kind(track: Track, words: Words): String? = when {
-        isDolby(track.mimeType) -> dolbyName(track)
-        track.channelCount == 1 -> words.mono
-        track.mimeType == MimeTypes.AUDIO_AAC -> "AAC"
-        track.mimeType == MimeTypes.AUDIO_MPEG_L2 || track.mimeType == MimeTypes.AUDIO_MPEG -> "MPEG"
-        else -> null
-    }
 
     private fun dolbyName(track: Track): String {
         val name = if (track.mimeType == MimeTypes.AUDIO_AC3) "Dolby Digital" else "Dolby Digital Plus"
@@ -66,10 +64,10 @@ object AudioLabels {
 
     private fun defined(language: String?) = language?.takeIf { it.isNotBlank() && it !in UNDEFINED }
 
+    /** In the device's language and spelling, like the TV app's own entries ("italiano" in Italian). */
     private fun displayName(language: String?): String? = language
         ?.let { Locale.forLanguageTag(it).displayLanguage }
         ?.takeIf { it.isNotBlank() }
-        ?.replaceFirstChar { it.titlecase() }
 
     /** ISO 639-2 codes that name no language. */
     private val UNDEFINED = setOf("und", "mul", "mis", "zxx")

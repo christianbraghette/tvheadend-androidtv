@@ -30,8 +30,6 @@
     <string name="status_failed">Channel unavailable</string>
     <!-- Audio menu entry for the second programme of a "dual mono" broadcast (e.g. original language). -->
     <string name="audio_dual_mono_second">Audio 2</string>
-    <!-- Audio menu: an extra mono track of a language that already has one ("Italiano · Mono"). -->
-    <string name="audio_mono">Mono</string>
     <!-- Audio menu: Dolby sent undecoded to the TV/receiver ("Italiano · Dolby Digital (passthrough)"). -->
     <string name="audio_passthrough">passthrough</string>
     <string name="connect">Connect and sync</string>

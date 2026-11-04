@@ -35,10 +35,7 @@ class TrackMenu(private val context: Context, private val audioOutput: AudioOutp
     /** Whether the second programme of a dual-mono track was picked. */
     var dualMonoSecond = false
 
-    private val words = AudioLabels.Words(
-        mono = context.getString(R.string.audio_mono),
-        passthrough = context.getString(R.string.audio_passthrough),
-    )
+    private val words = AudioLabels.Words(passthrough = context.getString(R.string.audio_passthrough))
 
     fun build(tracks: Tracks): Menu {
         val infos = ArrayList<TvTrackInfo>()

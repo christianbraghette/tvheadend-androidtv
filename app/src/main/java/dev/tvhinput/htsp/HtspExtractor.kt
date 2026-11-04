@@ -36,6 +36,7 @@ class HtspExtractor(
         val name = "Stream ${format.id} ($codec)"
         val audio = if (MimeTypes.isAudio(format.sampleMimeType)) AudioFrameReader(codec, name) else null
         val aspect = if (video) VideoAspectReader(codec, name) else null
+        val text = if (codec == "TEXTSUB") TextSubtitles() else null
         val gaps = TimestampGaps(name)
 
         /** Declares [newFormat] if it differs from the current one (Media3 then adapts the decoder). */
@@ -71,6 +72,7 @@ class HtspExtractor(
     private var body = ByteArray(64 * 1024)
     private val fields = HtsFieldReader()
     private val sample = ParsableByteArray()
+    private val cueSample = ParsableByteArray()
 
     override fun sniff(input: ExtractorInput) = true
 
@@ -181,7 +183,15 @@ class HtspExtractor(
             commitSample(track, timestamp - baseTimeUs, C.BUFFER_FLAG_KEY_FRAME, sampleSize)
             return
         }
-        if (!track.video) { // subtitles
+        val text = track.text
+        if (text != null) {
+            val cues = text.encode(body, offset, size, duration)
+            cueSample.reset(cues)
+            track.output.sampleData(cueSample, cues.size)
+            commitSample(track, timestamp - baseTimeUs, C.BUFFER_FLAG_KEY_FRAME, cues.size)
+            return
+        }
+        if (!track.video) { // DVB subtitles
             writeSample(track, offset, size)
             commitSample(track, timestamp - baseTimeUs, C.BUFFER_FLAG_KEY_FRAME, size)
             return
@@ -306,7 +316,11 @@ class HtspExtractor(
                     )
                 )
             }
-            else -> return null // teletext, RDS, ... are not played
+            // Teletext subtitles as text (tvheadend converts them), turned into cues by TextSubtitles.
+            // Each one replaces the previous: teletext shows one subtitle page at a time.
+            "TEXTSUB" -> builder.setSampleMimeType(MimeTypes.APPLICATION_MEDIA3_CUES)
+                .setCueReplacementBehavior(Format.CUE_REPLACEMENT_BEHAVIOR_REPLACE)
+            else -> return null // raw teletext, RDS, ... are not played
         }
         if (isVideo(codec)) {
             val width = stream.int("width") ?: 0
@@ -323,7 +337,7 @@ class HtspExtractor(
             }
             // Frame duration in µs.
             stream.int("duration")?.takeIf { it > 0 }?.let { builder.setFrameRate(1_000_000f / it) }
-        } else if (codec != "DVBSUB") {
+        } else if (codec != "DVBSUB" && codec != "TEXTSUB") {
             builder.setChannelCount(channels).setSampleRate(AudioFrameReader.SAMPLE_RATES.getOrElse(rateIndex) { 48000 })
             // DVB's ISO 639 audio_type: so the player doesn't pick an audio-description track by
             // default, and TV apps can mark it.

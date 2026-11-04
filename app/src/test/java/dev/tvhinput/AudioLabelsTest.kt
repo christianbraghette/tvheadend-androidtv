@@ -8,7 +8,7 @@ import java.util.Locale
 
 class AudioLabelsTest {
 
-    private val words = AudioLabels.Words(mono = "Mono", passthrough = "passthrough")
+    private val words = AudioLabels.Words(passthrough = "passthrough")
 
     @Before
     fun englishNames() = Locale.setDefault(Locale.ENGLISH)
@@ -22,8 +22,8 @@ class AudioLabelsTest {
     fun rai1() = assertEquals(
         listOf(
             "it" to null,
-            "it" to "Italian · Dolby Digital", // "und" Dolby: the channel's language
-            "it" to "Italian · Mono", // "und" mono (audio description)
+            "it" to "Italian · Dolby Digital", // "und" Dolby: the channel's language, and the codec
+            "it" to null, // "und" mono: the TV app's "· Mono" already tells it apart
             "en" to null,
         ),
         labels(
@@ -36,9 +36,9 @@ class AudioLabelsTest {
 
     @Test
     fun rai2() = assertEquals(
-        listOf("it" to null, "it" to "Italian · Mono", "en" to null),
+        listOf("it" to null, "it" to null, "en" to null),
         labels(
-            track("it", MimeTypes.AUDIO_AC3, 2),
+            track("it", MimeTypes.AUDIO_AC3, 2), // the main track being Dolby needs no label
             track("und", MimeTypes.AUDIO_MPEG_L2, 1),
             track("en", MimeTypes.AUDIO_MPEG_L2, 2),
         ),
@@ -52,15 +52,16 @@ class AudioLabelsTest {
 
     @Test
     fun noLanguageAnywhere() = assertEquals(
-        listOf(null to null, null to "Mono"),
+        listOf(null to null, null to null),
         labels(track(null, MimeTypes.AUDIO_MPEG_L2, 2), track("und", MimeTypes.AUDIO_MPEG_L2, 1)),
     )
 
     @Test
-    fun sameKindTwiceStaysDistinct() = assertEquals(
-        listOf("it" to null, "it" to "Italian · Mono", "it" to "Italian · Mono (3)"),
+    fun lookalikesGetANumber() = assertEquals(
+        listOf("it" to null, "it" to "Italian · 2", "it" to null, "it" to "Italian · 4"),
         labels(
             track("it", MimeTypes.AUDIO_MPEG_L2, 2),
+            track("und", MimeTypes.AUDIO_MPEG_L2, 2),
             track("und", MimeTypes.AUDIO_MPEG_L2, 1),
             track("und", MimeTypes.AUDIO_MPEG_L2, 1),
         ),

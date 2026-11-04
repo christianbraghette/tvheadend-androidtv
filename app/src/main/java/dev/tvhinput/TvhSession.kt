@@ -38,6 +38,7 @@ import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.ExoTimeoutException
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
@@ -316,6 +317,11 @@ class TvhSession(
             .filterIsInstance<MediaCodec.CodecException>()
             .any { it.message.orEmpty().contains("surface", ignoreCase = true) }
 
+    private fun isSurfaceSwapTimeout(error: PlaybackException): Boolean =
+        generateSequence<Throwable>(error) { it.cause }
+            .filterIsInstance<ExoTimeoutException>()
+            .any { it.timeoutOperation == ExoTimeoutException.TIMEOUT_OPERATION_DETACH_SURFACE }
+
     /** If the app never sends a new surface, the old one may still be fine: try it again. */
     private val restoreSurface = Runnable {
         if (!released) player.setVideoSurface(surface)
@@ -536,6 +542,15 @@ class TvhSession(
             if (surface != failedSurface) handler.postDelayed(restoreSurface, SURFACE_RESTORE_DELAY_MS)
             failedSurface = surface
             player.clearVideoSurface()
+            play(uuid)
+            return
+        }
+        // The TV app swapped surfaces while the player was busy (e.g. a decoder error on the old
+        // surface, or audio stalled on Bluetooth): Media3 gives up waiting for the old one to be
+        // released and stops, but it already uses the new one. Start again on it right away, as a
+        // retry so a player that stays stuck still ends in the usual error handling below.
+        if (isSurfaceSwapTimeout(error) && retries++ < MAX_RETRIES) {
+            Log.i(TAG, "Swapping the video surface timed out: restarting playback on the new one")
             play(uuid)
             return
         }
