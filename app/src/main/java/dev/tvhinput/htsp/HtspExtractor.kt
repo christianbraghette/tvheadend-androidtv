@@ -3,10 +3,13 @@ package dev.tvhinput.htsp
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.C
+import androidx.media3.common.ColorInfo
 import androidx.media3.common.Format
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.util.CodecSpecificDataUtil
 import androidx.media3.common.util.ParsableByteArray
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.container.NalUnitUtil
 import androidx.media3.extractor.Extractor
 import androidx.media3.extractor.ExtractorInput
 import androidx.media3.extractor.ExtractorOutput
@@ -35,12 +38,21 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
         var pendingDtsUs = 0L
         var pendingDurationUs = 0L
         var pendingKeyFrame = false
+
+        /** Presentation time of this video track's first keyframe, once seen. */
+        var firstKeyFrameUs = C.TIME_UNSET
+
+        // H.264: the format is declared at the first keyframe, with the SPS/PPS seen so far.
+        var formatPending = false
+        var sps: ByteArray? = null
+        var pps: ByteArray? = null
     }
 
     private lateinit var extractorOutput: ExtractorOutput
     private val tracks = HashMap<Int, Track>()
     private var started = false
     private var baseTimeUs = C.TIME_UNSET
+    private var firstPacketUs = C.TIME_UNSET
     private val header = ByteArray(4)
     private var body = ByteArray(64 * 1024)
     private val fields = HtsFieldReader()
@@ -106,8 +118,13 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
             val codec = stream.str("type") ?: continue
             val format = formatFor(index, codec, stream) ?: continue
             val output = extractorOutput.track(index, MimeTypes.getTrackType(format.sampleMimeType))
-            output.format(format)
-            tracks[index] = Track(output, codec, format)
+            val track = Track(output, codec, format)
+            // Like Kodi and Media3's TS extractor, configure the H.264 decoder with the stream's
+            // SPS/PPS instead of leaving it to find them in the data: some TV decoders started these
+            // channels only at the next IDR frame otherwise. tvheadend's own per-stream "meta" can't
+            // be used: it puts it on the top-level message.
+            if (codec == "H264") track.formatPending = true else output.format(format)
+            tracks[index] = track
             val video = if (isVideo(codec)) {
                 " ${format.width}x${format.height} aspect=${stream.int("aspect_num")}:${stream.int("aspect_den")} par=${format.pixelWidthHeightRatio}"
             } else ""
@@ -123,8 +140,20 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
         val track = tracks[stream] ?: return
         val keyFrame = !track.video || frameType == 'I'.code
 
-        // Every packet is passed through as it arrives; the player's sample queue itself skips
-        // video until the first keyframe.
+        // Packets are passed through as they arrive, except video before its first keyframe and
+        // the "leading" B-frames that follow it but show before it: they reference the previous
+        // GOP, which this subscription never received.
+        if (firstPacketUs == C.TIME_UNSET) firstPacketUs = timestamp
+        if (timestamp - firstPacketUs > FORMAT_WAIT_US) declarePendingFormats() // no keyframe: don't block audio
+        if (track.formatPending) collectParameterSets(track, offset, size)
+        if (track.video) {
+            if (track.firstKeyFrameUs == C.TIME_UNSET) {
+                if (!keyFrame) return
+                track.firstKeyFrameUs = timestamp
+                if (track.formatPending) declareFormat(track)
+            }
+            if (timestamp < track.firstKeyFrameUs) return
+        }
         if (baseTimeUs == C.TIME_UNSET) baseTimeUs = timestamp
 
         var start = offset
@@ -143,7 +172,7 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
             return
         }
 
-        // Field-coded interlaced video (H.264 PAFF, e.g. Italian channel 6) arrives as one packet
+        // Field-coded interlaced video (H.264 PAFF, e.g. Italian channel 1) arrives as one packet
         // per field, half a frame apart. Fed to the decoder one field at a time, the Chromecast
         // dropped ~3 frames/s; the TS path hands it whole frames and plays smoothly. So join a
         // field to the one before it: decode times half a frame duration apart. An I field always
@@ -170,6 +199,74 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
         val flags = if (track.pendingKeyFrame) C.BUFFER_FLAG_KEY_FRAME else 0
         track.output.sampleMetadata(track.pendingTimeUs, flags, track.pendingSize, 0, null)
         track.pendingSize = 0
+    }
+
+    /** Keeps the latest SPS and PPS (with a 3-byte start code, as Media3 expects) from `body[offset, offset + size)`. */
+    private fun collectParameterSets(track: Track, offset: Int, size: Int) {
+        val limit = offset + size
+        var i = findStartCode(offset, limit)
+        while (i < limit) {
+            val nal = i + 3
+            val next = findStartCode(nal, limit)
+            var end = next
+            while (end > nal && body[end - 1].toInt() == 0) end-- // zero byte of a 4-byte start code
+            if (end > nal) {
+                when (body[nal].toInt() and 0x1f) {
+                    7 -> track.sps = body.copyOfRange(i, end)
+                    8 -> track.pps = body.copyOfRange(i, end)
+                }
+            }
+            i = next
+        }
+    }
+
+    private fun findStartCode(from: Int, limit: Int): Int {
+        var i = from
+        while (i + 2 < limit) {
+            if (body[i].toInt() == 0 && body[i + 1].toInt() == 0 && body[i + 2].toInt() == 1) return i
+            i++
+        }
+        return limit
+    }
+
+    /** Declares an H.264 track's format, with codec config from its SPS/PPS when both were seen. */
+    private fun declareFormat(track: Track) {
+        track.formatPending = false
+        val sps = track.sps
+        val pps = track.pps
+        if (sps != null && pps != null) {
+            try {
+                val data = NalUnitUtil.parseSpsNalUnit(sps, 3, sps.size)
+                val b = track.format.buildUpon()
+                    .setCodecs(CodecSpecificDataUtil.buildAvcCodecString(
+                        data.profileIdc, data.constraintsFlagsAndReservedZero2Bits, data.levelIdc,
+                    ))
+                    .setColorInfo(
+                        ColorInfo.Builder()
+                            .setColorSpace(data.colorSpace)
+                            .setColorRange(data.colorRange)
+                            .setColorTransfer(data.colorTransfer)
+                            .setLumaBitdepth(data.bitDepthLumaMinus8 + 8)
+                            .setChromaBitdepth(data.bitDepthChromaMinus8 + 8)
+                            .build()
+                    )
+                    .setInitializationData(listOf(sps, pps))
+                    .setMaxNumReorderSamples(data.maxNumReorderFrames)
+                if (track.format.width <= 0 || track.format.height <= 0) b.setWidth(data.width).setHeight(data.height)
+                // tvheadend's display aspect has been right for these channels; the SPS is the fallback.
+                if (track.format.pixelWidthHeightRatio == 1f) b.setPixelWidthHeightRatio(data.pixelWidthHeightRatio)
+                track.format = b.build()
+            } catch (e: RuntimeException) {
+                Log.w(TAG, "Unreadable SPS, decoder starts without codec config: ${e.message}")
+            }
+        } else {
+            Log.i(TAG, "No SPS/PPS before the first keyframe, decoder starts without codec config")
+        }
+        track.output.format(track.format)
+    }
+
+    private fun declarePendingFormats() {
+        for (track in tracks.values) if (track.formatPending) declareFormat(track)
     }
 
     /**
@@ -262,6 +359,7 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
         const val TAG = "HtspExtractor"
         val SAMPLE_RATES = intArrayOf(96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350)
         const val NONE = Long.MIN_VALUE
+        const val FORMAT_WAIT_US = 3_000_000L
         const val FIELD_TOLERANCE_US = 2L // 90 kHz -> µs rounding
         val METHOD = HtsFieldReader.name("method")
         val STREAM = HtsFieldReader.name("stream")
