@@ -7,9 +7,11 @@ import androidx.media3.common.ColorInfo
 import androidx.media3.common.Format
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.util.CodecSpecificDataUtil
+import androidx.media3.common.util.ParsableBitArray
 import androidx.media3.common.util.ParsableByteArray
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.container.NalUnitUtil
+import androidx.media3.extractor.Ac3Util
 import androidx.media3.extractor.Extractor
 import androidx.media3.extractor.ExtractorInput
 import androidx.media3.extractor.ExtractorOutput
@@ -30,6 +32,9 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
     private class Track(val output: TrackOutput, val codec: String, var format: Format) {
         val video = isVideo(codec)
         val aac = codec == "AAC"
+
+        /** AC3/E-AC3 whose bitrate is still unknown (see [declareDolbyBitrate]). */
+        var dolbyBitratePending = codec == "AC3" || codec == "EAC3"
 
         // A video picture whose data is written but not yet committed, in case the next packet
         // is its second field (see onPacket).
@@ -162,6 +167,7 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
             if (skip < 0) return
             start += skip
         }
+        if (track.dolbyBitratePending) declareDolbyBitrate(track, offset, size)
         val sampleSize = offset + size - start
         sample.reset(body, start + sampleSize)
         sample.setPosition(start)
@@ -267,6 +273,29 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
 
     private fun declarePendingFormats() {
         for (track in tracks.values) if (track.formatPending) declareFormat(track)
+    }
+
+    /**
+     * Declares the real bitrate of an AC3/E-AC3 track from its first syncframe. Without it Media3
+     * sizes the passthrough AudioTrack for the codec's maximum rate (192 kB for E-AC3, ~11 s of a
+     * typical 140 kbit/s DVB-T stream), and TVs that only start a direct output once that buffer
+     * is full stayed silent on a frozen first frame for that long after every zap.
+     */
+    private fun declareDolbyBitrate(track: Track, offset: Int, size: Int) {
+        track.dolbyBitratePending = false
+        if (size < 8 || body[offset] != 0x0b.toByte() || body[offset + 1] != 0x77.toByte()) return
+        val info = try {
+            Ac3Util.parseAc3SyncframeInfo(ParsableBitArray(body).apply { setPosition(offset * 8) })
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Unparseable ${track.codec} syncframe", e)
+            return
+        }
+        if (info.bitrate <= 0 || info.frameSize <= 0) return
+        // A packet can hold several syncframes (e.g. E-AC3 dependent substreams): scale to all of it.
+        val bitrate = (info.bitrate.toLong() * size / info.frameSize).toInt()
+        Log.i(TAG, "${track.codec} bitrate ${bitrate / 1000} kbit/s")
+        track.format = track.format.buildUpon().setAverageBitrate(bitrate).build()
+        track.output.format(track.format)
     }
 
     /**
