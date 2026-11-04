@@ -76,10 +76,11 @@ class SetupActivity : ComponentActivity() {
 
                 showStatus(getString(R.string.setup_importing, info.name, info.version, config.protocol.name))
                 val sync = TvProviderSync(applicationContext, client)
-                val channels = withContext(Dispatchers.IO) { sync.syncChannels() }
+                val snapshot = withContext(Dispatchers.IO) { sync.fetch() }
+                val channels = withContext(Dispatchers.IO) { sync.syncChannels(snapshot) }
 
                 showStatus(getString(R.string.setup_loading_guide, channels.size))
-                val programs = withContext(Dispatchers.IO) { sync.syncPrograms(channels) }
+                val programs = withContext(Dispatchers.IO) { sync.syncPrograms(snapshot.events, channels) }
                 SyncWorker.schedule(applicationContext)
 
                 showStatus(getString(R.string.setup_done, channels.size, programs), StatusKind.DONE)

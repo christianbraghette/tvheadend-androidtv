@@ -38,6 +38,17 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
         fun onConnectionLost(error: IOException)
     }
 
+    /** Receives the asynchronous metadata (channelAdd, eventUpdate, ...) of `enableAsyncMetadata`. */
+    interface MetadataListener {
+        /** Called on the reader thread, in the order the server sent the messages. */
+        fun onMetadata(method: String, msg: HtsMsg)
+
+        fun onConnectionLost(error: IOException)
+    }
+
+    /** Set before sending `enableAsyncMetadata`: the server starts its dump right after replying. */
+    @Volatile var metadataListener: MetadataListener? = null
+
     private val input = DataInputStream(BufferedInputStream(socket.getInputStream(), 256 * 1024))
     private val output = BufferedOutputStream(socket.getOutputStream())
     private val seq = AtomicInteger()
@@ -176,6 +187,14 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
                     BufferPool.recycle(body)
                     continue
                 }
+                if (subscriptionId == NONE && method != null) {
+                    val metadata = metadataListener
+                    if (metadata != null) {
+                        metadata.onMetadata(method, HtsMsg.deserialize(body, 0, length))
+                        BufferPool.recycle(body)
+                        continue
+                    }
+                }
                 val listener = if (subscriptionId != NONE) subscriptions[subscriptionId.toInt()] else null
                 if (listener != null && method != null) listener.onMessage(method, body, length)
                 else BufferPool.recycle(body)
@@ -193,6 +212,7 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
         pending.values.forEach { it.completeExceptionally(error) }
         subscriptions.values.forEach { it.onConnectionLost(error) }
         subscriptions.clear()
+        metadataListener?.onConnectionLost(error)
     }
 
     override fun close() {

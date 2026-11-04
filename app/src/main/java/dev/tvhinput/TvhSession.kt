@@ -1,9 +1,13 @@
 package dev.tvhinput
 
+import android.content.BroadcastReceiver
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
 import android.graphics.Color
+import android.media.tv.TvContentRating
 import android.media.tv.TvContract
 import android.media.tv.TvInputManager
 import android.media.tv.TvInputService
@@ -19,6 +23,7 @@ import android.view.View
 import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.annotation.OptIn
+import androidx.core.content.ContextCompat
 import androidx.media3.common.C
 import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
@@ -120,8 +125,27 @@ class TvhSession(
     private var playToken = 0
     private var prewarmedToken = -1
 
+    private val tvInputManager = context.getSystemService(TvInputManager::class.java)
+    /** Whether the current channel is meant to play: false until the parental check passes. */
+    private var started = false
+    private var blockedRating: TvContentRating? = null
+    /** Ratings the user unlocked with the PIN on this channel. */
+    private val unblockedRatings = HashSet<TvContentRating>()
+    private val ratingCheck = Runnable { checkRating() }
+    private val ratingSettingsReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) = checkRating()
+    }
+
     init {
         setOverlayViewEnabled(true)
+        ContextCompat.registerReceiver(
+            context, ratingSettingsReceiver,
+            IntentFilter().apply {
+                addAction(TvInputManager.ACTION_BLOCKED_RATINGS_CHANGED)
+                addAction(TvInputManager.ACTION_PARENTAL_CONTROLS_ENABLED_CHANGED)
+            },
+            ContextCompat.RECEIVER_NOT_EXPORTED, // still gets these system broadcasts
+        )
         // Left over from the per-channel buffer tuning that default buffering replaced.
         for (name in listOf("tvh_unstable_channels", "tvh_start_buffer_htsp", "tvh_start_buffer_http")) {
             context.deleteSharedPreferences(name)
@@ -137,9 +161,70 @@ class TvhSession(
         handler.removeCallbacksAndMessages(null)
         notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_TUNING)
         setShutter(true)
-        play(uuid)
-        notifyContentAllowed()
+        started = false
+        blockedRating = null
+        unblockedRatings.clear()
+        checkRating() // starts playback unless parental controls block the program on air
         return true
+    }
+
+    override fun onUnblockContent(unblockedRating: TvContentRating) {
+        unblockedRatings += unblockedRating
+        checkRating()
+    }
+
+    /**
+     * Parental controls are the TV input's job: when the program on air has a rating the user
+     * blocked, stop playing, cover the picture and tell the TV app, which then offers the PIN.
+     * Checked on tune, when the next program starts and when the settings change.
+     */
+    private fun checkRating() {
+        handler.removeCallbacks(ratingCheck)
+        val uuid = currentChannelUuid ?: return
+        val uri = currentChannelUri ?: return
+        val now = System.currentTimeMillis()
+        val program = currentProgram(uri, now)
+        val nextCheck = program?.endMs?.takeIf { it > now } ?: (now + RATING_RECHECK_MS)
+        handler.postDelayed(ratingCheck, (nextCheck - now).coerceIn(1_000L, RATING_RECHECK_MS))
+
+        val blocked = if (tvInputManager?.isParentalControlsEnabled == true) {
+            program?.ratings?.firstOrNull { it !in unblockedRatings && tvInputManager.isRatingBlocked(it) }
+        } else null
+        if (blocked != null) {
+            if (blocked == blockedRating) return
+            Log.i(TAG, "Blocked by parental controls: ${blocked.flattenToString()}")
+            blockedRating = blocked
+            started = false
+            player.stop()
+            handler.removeCallbacks(notifyBuffering)
+            setShutter(true)
+            notifyContentBlocked(blocked)
+        } else {
+            blockedRating = null
+            if (started) return
+            started = true
+            play(uuid)
+            notifyContentAllowed()
+        }
+    }
+
+    private class Program(val ratings: List<TvContentRating>, val endMs: Long)
+
+    private fun currentProgram(channelUri: Uri, now: Long): Program? = try {
+        context.contentResolver.query(
+            TvContract.buildProgramsUriForChannel(channelUri, now, now),
+            arrayOf(TvContract.Programs.COLUMN_CONTENT_RATING, TvContract.Programs.COLUMN_END_TIME_UTC_MILLIS),
+            null, null, null,
+        )?.use { c ->
+            if (!c.moveToFirst()) return@use null
+            val ratings = c.getString(0).orEmpty().split(',').mapNotNull { flat ->
+                flat.trim().takeIf { it.isNotEmpty() }?.let { runCatching { TvContentRating.unflattenFromString(it) }.getOrNull() }
+            }
+            Program(ratings, c.getLong(1))
+        }
+    } catch (e: RuntimeException) {
+        Log.w(TAG, "Couldn't read the program on air: ${e.message}")
+        null
     }
 
     /** Called on the loader thread when an HTSP subscription starts. */
@@ -153,6 +238,7 @@ class TvhSession(
     }
 
     private fun play(uuid: String) {
+        if (!started) return // blocked by parental controls: retries and restarts wait for the PIN
         playToken++
         val uri = if (useHtsp) "htsp://channel/${client.htspChannelId(uuid)}" else client.streamUrl(uuid)
         Log.i(TAG, "Playing $uri")
@@ -289,6 +375,7 @@ class TvhSession(
 
     override fun onRelease() {
         handler.removeCallbacksAndMessages(null)
+        context.unregisterReceiver(ratingSettingsReceiver)
         player.removeListener(this)
         player.release()
         prewarmer?.release() // closing the connection below also ends its subscriptions
@@ -451,6 +538,8 @@ class TvhSession(
         const val RETRY_DELAY_MS = 2000L
         const val BUFFERING_NOTIFY_DELAY_MS = 1000L
         const val PREWARM_DELAY_MS = 2000L
+        /** Re-checks the rating at least this often, e.g. when the guide arrives after the tune. */
+        const val RATING_RECHECK_MS = 5 * 60_000L
 
         // These reasons exist from Android 11; older TV apps get the generic one.
         val REASON_INSUFFICIENT_RESOURCE =

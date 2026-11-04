@@ -30,6 +30,8 @@ data class TvhEvent(
     val image: String?,
     val season: Int?,
     val episode: Int?,
+    /** Minimum viewer age from the broadcast's parental rating, or null when unrated. */
+    val ageRating: Int? = null,
 )
 
 /** Thin client for the tvheadend HTTP/JSON API. All calls are blocking. */
@@ -104,6 +106,7 @@ class TvhClient(val config: TvhConfig) {
                     image = o.optStringOrNull("image"),
                     season = o.optInt("seasonNumber").takeIf { it > 0 },
                     episode = o.optInt("episodeNumber").takeIf { it > 0 },
+                    ageRating = o.optInt("ageRating").takeIf { it > 0 },
                 )
             }
             start += entries.length()
