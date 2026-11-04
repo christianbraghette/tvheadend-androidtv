@@ -325,8 +325,10 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
         if (info.bitrate <= 0 || info.frameSize <= 0) return
         // A packet can hold several syncframes (e.g. E-AC3 dependent substreams): scale to all of it.
         val bitrate = (info.bitrate.toLong() * size / info.frameSize).toInt()
-        Log.i(TAG, "${track.codec} bitrate ${bitrate / 1000} kbit/s")
-        track.format = track.format.buildUpon().setAverageBitrate(bitrate).build()
+        // The syncframe also has the real layout (5.1 = 6 with LFE), which TV apps show per track.
+        val channels = info.channelCount.takeIf { it > 0 } ?: track.format.channelCount
+        Log.i(TAG, "${track.codec} bitrate ${bitrate / 1000} kbit/s, $channels channels")
+        track.format = track.format.buildUpon().setAverageBitrate(bitrate).setChannelCount(channels).build()
         track.output.format(track.format)
     }
 
