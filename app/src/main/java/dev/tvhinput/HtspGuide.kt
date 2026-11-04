@@ -43,6 +43,7 @@ class HtspGuide(private val client: TvhClient, private val listener: Listener) :
     private val fallbackNumbers = HashMap<String, String>()
     private val initialEvents = ArrayList<TvhEvent>()
     @Volatile private var initialDone = false
+    private var readerLowered = false // reader thread only
     /** Uuids by HTSP id from the HTTP API, for servers whose HTSP doesn't send channelIdStr. */
     private var httpUuids: Map<Int, String>? = null
 
@@ -60,6 +61,11 @@ class HtspGuide(private val client: TvhClient, private val listener: Listener) :
     }
 
     override fun onMetadata(method: String, msg: HtsMsg) {
+        // This connection's reader decodes the whole guide: keep it out of playback's way.
+        if (!readerLowered) {
+            readerLowered = true
+            lowerCurrentThreadPriority()
+        }
         when (method) {
             "channelAdd", "channelUpdate" -> {
                 val id = msg.int("channelId") ?: return
@@ -83,7 +89,11 @@ class HtspGuide(private val client: TvhClient, private val listener: Listener) :
                 val snapshot = snapshot()
                 initialEvents.clear()
                 initialEvents.trimToSize()
-                Log.i(TAG, "Initial sync: ${snapshot.channels.size} channels, ${snapshot.events.size} events")
+                Log.i(
+                    TAG,
+                    "Initial sync: ${snapshot.channels.size} channels (${snapshot.channels.count { it.icon != null }} with a logo), " +
+                        "${snapshot.events.size} events (${snapshot.events.count { it.image != null }} with an image)",
+                )
                 listener.onSnapshot(snapshot)
             }
         }

@@ -9,26 +9,31 @@ import androidx.work.NetworkType
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.withContext
 import java.io.IOException
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /** Periodically refreshes channels and EPG from tvheadend. */
 class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
 
-    override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
-        val config = Settings.load(applicationContext) ?: return@withContext Result.success()
+    // Its own background-priority thread, not Dispatchers.IO: the sync may run while a channel plays.
+    override suspend fun doWork(): Result = Executors.newSingleThreadExecutor(backgroundThreads("tvh-sync"))
+        .asCoroutineDispatcher().use { dispatcher -> withContext(dispatcher) { sync() } }
+
+    private fun sync(): Result {
+        val config = Settings.load(applicationContext) ?: return Result.success()
         try {
             val programs = TvProviderSync(applicationContext, TvhClient(config)).syncAll()
             Log.i(TAG, "Sync finished, $programs programs")
-            Result.success()
+            return Result.success()
         } catch (e: IOException) {
             Log.w(TAG, "Sync failed, will retry", e)
-            Result.retry()
+            return Result.retry()
         } catch (e: Exception) {
             Log.e(TAG, "Sync failed", e)
-            Result.failure()
+            return Result.failure()
         }
     }
 

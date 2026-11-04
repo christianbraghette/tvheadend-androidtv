@@ -20,7 +20,7 @@ import kotlin.concurrent.thread
 class GuideMonitor(private val context: Context) {
 
     // Provider writes run here, in the order tvheadend sent the changes, off the reader thread.
-    private val executor = Executors.newSingleThreadExecutor { Thread(it, "tvh-guide-apply").apply { isDaemon = true } }
+    private val executor = Executors.newSingleThreadExecutor(backgroundThreads("tvh-guide-apply"))
     @Volatile private var running = false
     @Volatile private var connection: HtspConnection? = null
     private var loopThread: Thread? = null
