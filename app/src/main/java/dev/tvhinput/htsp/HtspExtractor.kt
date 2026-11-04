@@ -224,7 +224,14 @@ class HtspExtractor(
         if (!secondField) commitPending(track)
         // After committing the previous picture, so a new picture shape applies from this keyframe on.
         if (keyFrame && !secondField && !track.formatPending) {
-            track.aspect?.let { track.update(it.read(track.format, body, offset, size)) }
+            track.aspect?.let {
+                val picture = it.read(track.format, body, offset, size)
+                // A new H.264 picture size (e.g. Rai 3: 720p regional news -> 1080i national) means a
+                // new decoder: give it this keyframe's SPS/PPS, not the ones from tune-in, or it starts
+                // configured for the old size and the Amlogic decoder stalls on the in-band switch.
+                val sizeChanged = picture.width != track.format.width || picture.height != track.format.height
+                track.update(if (sizeChanged && track.codec == "H264") withKeyFrameConfig(picture, offset, size) else picture)
+            }
         }
         writeSample(track, offset, size)
         if (secondField) {
@@ -275,21 +282,7 @@ class HtspExtractor(
         if (sps != null && pps != null) {
             try {
                 val data = NalUnitUtil.parseSpsNalUnit(sps, 3, sps.size)
-                val b = track.format.buildUpon()
-                    .setCodecs(CodecSpecificDataUtil.buildAvcCodecString(
-                        data.profileIdc, data.constraintsFlagsAndReservedZero2Bits, data.levelIdc,
-                    ))
-                    .setColorInfo(
-                        ColorInfo.Builder()
-                            .setColorSpace(data.colorSpace)
-                            .setColorRange(data.colorRange)
-                            .setColorTransfer(data.colorTransfer)
-                            .setLumaBitdepth(data.bitDepthLumaMinus8 + 8)
-                            .setChromaBitdepth(data.bitDepthChromaMinus8 + 8)
-                            .build()
-                    )
-                    .setInitializationData(listOf(sps, pps))
-                    .setMaxNumReorderSamples(data.maxNumReorderFrames)
+                val b = withCodecConfig(track.format.buildUpon(), data, sps, pps)
                 if (track.format.width <= 0 || track.format.height <= 0) b.setWidth(data.width).setHeight(data.height)
                 // tvheadend's display aspect has been right for these channels; the SPS is the fallback.
                 if (track.format.pixelWidthHeightRatio == 1f) b.setPixelWidthHeightRatio(data.pixelWidthHeightRatio)
@@ -301,6 +294,45 @@ class HtspExtractor(
             Log.i(TAG, "No SPS/PPS before the first keyframe, decoder starts without codec config")
         }
         track.output.format(track.format)
+    }
+
+    private fun withCodecConfig(b: Format.Builder, data: NalUnitUtil.SpsData, sps: ByteArray, pps: ByteArray): Format.Builder = b
+        .setCodecs(CodecSpecificDataUtil.buildAvcCodecString(
+            data.profileIdc, data.constraintsFlagsAndReservedZero2Bits, data.levelIdc,
+        ))
+        .setColorInfo(
+            ColorInfo.Builder()
+                .setColorSpace(data.colorSpace)
+                .setColorRange(data.colorRange)
+                .setColorTransfer(data.colorTransfer)
+                .setLumaBitdepth(data.bitDepthLumaMinus8 + 8)
+                .setChromaBitdepth(data.bitDepthChromaMinus8 + 8)
+                .build()
+        )
+        .setInitializationData(listOf(sps, pps))
+        .setMaxNumReorderSamples(data.maxNumReorderFrames)
+
+    /**
+     * [format] with the codec config of the H.264 keyframe at `body[offset, offset + size)`. Without
+     * both an SPS and a PPS there, the old config is dropped so the decoder takes it from the stream.
+     */
+    private fun withKeyFrameConfig(format: Format, offset: Int, size: Int): Format {
+        var sps: ByteArray? = null
+        var pps: ByteArray? = null
+        StartCodes.forEachNal(body, offset, size) { start, end, type ->
+            when (type) {
+                NAL_SPS -> if (sps == null) sps = body.copyOfRange(start, end)
+                NAL_PPS -> if (pps == null) pps = body.copyOfRange(start, end)
+            }
+            sps == null || pps == null
+        }
+        val s = sps
+        val p = pps
+        val config = if (s != null && p != null) {
+            runCatching { withCodecConfig(format.buildUpon(), NalUnitUtil.parseSpsNalUnit(s, 3, s.size), s, p) }.getOrNull()
+        } else null
+        if (config == null) Log.w(TAG, "No usable SPS/PPS in the keyframe: new decoder starts without codec config")
+        return (config ?: format.buildUpon().setInitializationData(emptyList())).build()
     }
 
     private fun declarePendingFormats() {
