@@ -137,7 +137,13 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
         val id = subscriptionIds.incrementAndGet()
         subscriptions[id] = listener
         try {
-            val msg = HtsMsg.of("method" to "subscribe", "channelId" to channelId, "subscriptionId" to id)
+            val msg = HtsMsg.of(
+                "method" to "subscribe", "channelId" to channelId, "subscriptionId" to id,
+                // tvheadend holds a new subscription's packets until it knows all its streams, then
+                // sends ~2 s at once; above its default 500 KB queue it drops B and P frames, which
+                // made channel starts stutter. Live TV would rather queue than drop.
+                "queueDepth" to QUEUE_DEPTH_BYTES,
+            )
             if (weight != null) msg["weight"] = weight
             request(msg)
         } catch (e: IOException) {
@@ -244,6 +250,7 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
         private val METHOD = HtsFieldReader.name("method")
         private const val WATCHDOG_MS = 5_000L
         private const val IDLE_BEFORE_PING_NS = 10_000_000_000L
+        private const val QUEUE_DEPTH_BYTES = 4_000_000L
         private const val PING_TIMEOUT_MS = 5_000L
         private val TIMER = Executors.newSingleThreadScheduledExecutor { Thread(it, "htsp-watchdog").apply { isDaemon = true } }
 
