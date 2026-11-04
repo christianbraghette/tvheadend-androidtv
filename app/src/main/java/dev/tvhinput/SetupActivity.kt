@@ -1,17 +1,18 @@
 package dev.tvhinput
 
-import android.app.Activity
 import android.media.tv.TvInputInfo
 import android.os.Bundle
-import android.widget.Button
-import android.widget.CheckBox
-import android.widget.EditText
-import android.widget.RadioGroup
-import android.widget.TextView
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.lifecycle.lifecycleScope
 import dev.tvhinput.htsp.HtspConnection
+import dev.tvhinput.ui.SetupScreen
+import dev.tvhinput.ui.SetupState
+import dev.tvhinput.ui.SetupStatus
+import dev.tvhinput.ui.StatusKind
+import dev.tvhinput.ui.TvhTheme
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.MainScope
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -19,111 +20,78 @@ import kotlinx.coroutines.withContext
  * Setup screen. The TV app opens it when the user adds this input, and again from its
  * channel source settings to change the server or force a resync (there is no launcher entry).
  */
-class SetupActivity : Activity() {
-    private val scope = MainScope()
-
-    private lateinit var host: EditText
-    private lateinit var port: EditText
-    private lateinit var https: CheckBox
-    private lateinit var webRoot: EditText
-    private lateinit var username: EditText
-    private lateinit var password: EditText
-    private lateinit var profile: EditText
-    private lateinit var protocol: RadioGroup
-    private lateinit var htspPort: EditText
-    private lateinit var connect: Button
-    private lateinit var status: TextView
+class SetupActivity : ComponentActivity() {
+    private lateinit var state: SetupState
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_setup)
-        host = findViewById(R.id.host)
-        port = findViewById(R.id.port)
-        https = findViewById(R.id.https)
-        webRoot = findViewById(R.id.web_root)
-        username = findViewById(R.id.username)
-        password = findViewById(R.id.password)
-        profile = findViewById(R.id.profile)
-        protocol = findViewById(R.id.protocol)
-        htspPort = findViewById(R.id.htsp_port)
-        connect = findViewById(R.id.connect)
-        status = findViewById(R.id.status)
-
-        Settings.load(this)?.let { c ->
-            host.setText(c.host)
-            port.setText(c.port.toString())
-            https.isChecked = c.https
-            webRoot.setText(c.webRoot)
-            username.setText(c.username)
-            password.setText(c.password)
-            profile.setText(c.profile)
-            protocol.check(if (c.protocol == StreamProtocol.HTSP) R.id.protocol_htsp else R.id.protocol_http)
-            htspPort.setText(c.htspPort.toString())
+        state = SetupState(Settings.load(this))
+        setContent {
+            TvhTheme { SetupScreen(state, onConnect = ::connectAndSync) }
         }
-        connect.setOnClickListener { connectAndSync() }
-    }
-
-    override fun onDestroy() {
-        scope.cancel()
-        super.onDestroy()
     }
 
     private fun readForm(): TvhConfig? {
-        var h = host.text.toString().trim().substringAfter("://").substringBefore('/')
-        var p = port.text.toString().toIntOrNull()
+        var h = state.host.trim().substringAfter("://").substringBefore('/')
+        var p = state.port.toIntOrNull()
         // Accept "host:port" typed into the host field.
         HOST_WITH_PORT.matchEntire(h)?.let { m ->
             h = m.groupValues[1]
             p = m.groupValues[2].toInt()
         }
-        if (h.isEmpty()) {
-            host.error = getString(R.string.host)
-            return null
-        }
+        state.hostError = h.isEmpty()
+        if (h.isEmpty()) return null
         return TvhConfig(
             host = h,
             port = p ?: 9981,
-            https = https.isChecked,
-            webRoot = webRoot.text.toString().trim(),
-            username = username.text.toString().trim(),
-            password = password.text.toString(),
-            profile = profile.text.toString().trim(),
-            protocol = if (protocol.checkedRadioButtonId == R.id.protocol_htsp) StreamProtocol.HTSP else StreamProtocol.HTTP,
-            htspPort = htspPort.text.toString().toIntOrNull() ?: 9982,
+            https = state.https,
+            webRoot = state.webRoot.trim(),
+            username = state.username.trim(),
+            password = state.password,
+            profile = state.profile.trim(),
+            protocol = state.protocol,
+            htspPort = state.htspPort.toIntOrNull() ?: 9982,
         )
     }
 
+    private fun showStatus(text: String, kind: StatusKind = StatusKind.WORKING) {
+        state.status = SetupStatus(text, kind)
+    }
+
     private fun connectAndSync() {
+        if (state.syncing) return
         val config = readForm() ?: return
-        connect.isEnabled = false
-        status.text = getString(R.string.setup_connecting)
-        scope.launch {
+        state.syncing = true
+        showStatus(getString(R.string.setup_connecting))
+        lifecycleScope.launch {
             try {
                 val client = TvhClient(config)
                 val info = withContext(Dispatchers.IO) { client.serverInfo() }
                 if (config.protocol == StreamProtocol.HTSP) {
-                    status.text = getString(R.string.setup_checking_htsp)
+                    showStatus(getString(R.string.setup_checking_htsp))
                     // Fail here, not at the first tune, if HTSP is unreachable or not allowed.
                     withContext(Dispatchers.IO) { HtspConnection.connect(config).close() }
                 }
                 Settings.save(this@SetupActivity, config)
 
-                status.text = getString(R.string.setup_importing, info.name, info.version, config.protocol.name)
+                showStatus(getString(R.string.setup_importing, info.name, info.version, config.protocol.name))
                 val sync = TvProviderSync(applicationContext, client)
                 val channels = withContext(Dispatchers.IO) { sync.syncChannels() }
 
-                status.text = getString(R.string.setup_loading_guide, channels.size)
+                showStatus(getString(R.string.setup_loading_guide, channels.size))
                 val programs = withContext(Dispatchers.IO) { sync.syncPrograms(channels) }
                 SyncWorker.schedule(applicationContext)
 
-                status.text = getString(R.string.setup_done, channels.size, programs)
+                showStatus(getString(R.string.setup_done, channels.size, programs), StatusKind.DONE)
                 setResult(RESULT_OK)
                 // When opened from the system TV app's "add source" flow, return to it.
                 if (intent.hasExtra(TvInputInfo.EXTRA_INPUT_ID)) finish()
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                status.text = getString(R.string.setup_error, e.message ?: e.javaClass.simpleName)
+                showStatus(getString(R.string.setup_error, e.message ?: e.javaClass.simpleName), StatusKind.ERROR)
             } finally {
-                connect.isEnabled = true
+                state.syncing = false
             }
         }
     }

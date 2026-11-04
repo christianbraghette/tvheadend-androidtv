@@ -2,13 +2,20 @@
 <resources>
     <string name="app_name">Tvheadend</string>
     <string name="setup_title">Tvheadend server</string>
+    <string name="setup_subtitle">Connect to your tvheadend server to import its channels and program guide into the TV app.</string>
+    <string name="section_server">Server</string>
+    <string name="section_account">Account</string>
+    <string name="section_streaming">Streaming</string>
+    <string name="host_required">Enter the server\'s host name or IP address</string>
+    <string name="protocol_http_hint">Streams over the web interface port through a server streaming profile.</string>
+    <string name="protocol_htsp_hint">Streams over tvheadend\'s native protocol on its own port.</string>
     <string name="host">Host or IP address</string>
     <string name="port">Port</string>
     <string name="https">Use HTTPS</string>
     <string name="web_root">Web root (optional, e.g. /tvh)</string>
     <string name="username">Username</string>
     <string name="password">Password</string>
-    <string name="profile">Streaming profile (HTTP only)</string>
+    <string name="profile">Streaming profile</string>
     <string name="protocol">Streaming protocol</string>
     <string name="protocol_http">HTTP</string>
     <string name="protocol_htsp">HTSP</string>

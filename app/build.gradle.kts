@@ -2,11 +2,12 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     id("com.android.application")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
     namespace = "dev.tvhinput"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "dev.tvhinput"
@@ -20,6 +21,10 @@ android {
         release {
             isMinifyEnabled = false
         }
+    }
+
+    buildFeatures {
+        compose = true
     }
 
     testOptions {
@@ -46,6 +51,11 @@ dependencies {
     implementation("androidx.media3:media3-ui:$media3")
     // FFmpeg audio decoders (MP2, AC3, E-AC3...) that most Android TV devices lack.
     implementation("org.jellyfin.media3:media3-ffmpeg-decoder:$media3+1")
+    implementation(platform("androidx.compose:compose-bom:2026.09.00"))
+    implementation("androidx.compose.foundation:foundation")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.tv:tv-material:1.1.0")
+    implementation("androidx.activity:activity-compose:1.13.0")
     implementation("androidx.work:work-runtime-ktx:2.10.2")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")

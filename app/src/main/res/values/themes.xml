@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The setup screen is drawn with Compose for TV (ui/Theme.kt); this only styles the window. -->
+    <style name="Theme.Tvh" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/tvh_surface</item>
+        <item name="android:colorBackground">@color/tvh_surface</item>
+    </style>
+</resources>
