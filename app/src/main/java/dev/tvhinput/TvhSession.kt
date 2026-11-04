@@ -26,35 +26,23 @@ import android.widget.TextView
 import androidx.annotation.OptIn
 import androidx.core.content.ContextCompat
 import androidx.media3.common.C
-import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
+import androidx.media3.common.VideoSize
 import androidx.media3.common.text.CueGroup
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
-import androidx.media3.exoplayer.DecoderReuseEvaluation
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.Renderer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
-import androidx.media3.common.MimeTypes
-import androidx.media3.common.AudioAttributes
-import androidx.media3.exoplayer.audio.AudioCapabilities
-import androidx.media3.exoplayer.audio.AudioSink
-import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
-import java.util.Locale
-import androidx.media3.exoplayer.audio.DefaultAudioSink
-import androidx.media3.exoplayer.audio.ForwardingAudioSink
-import androidx.media3.exoplayer.mediacodec.MediaCodecInfo
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
-import androidx.media3.exoplayer.util.EventLogger
-import androidx.media3.exoplayer.video.MediaCodecVideoRenderer
-import androidx.media3.exoplayer.video.VideoRendererEventListener
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import androidx.media3.exoplayer.util.EventLogger
 import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.extractor.ExtractorsFactory
 import androidx.media3.extractor.text.DefaultSubtitleParserFactory
@@ -83,7 +71,7 @@ class TvhSession(
     private val mediaSourceFactory = if (useHtsp) {
         ProgressiveMediaSource.Factory(
             HtspDataSource.Factory(::connectHtsp) { error -> handler.post { onServerStatus(error) } },
-            ExtractorsFactory { arrayOf(HtspExtractor(DefaultSubtitleParserFactory())) },
+            ExtractorsFactory { arrayOf(HtspExtractor(DefaultSubtitleParserFactory(), ::onDualMono)) },
         )
     } else {
         ProgressiveMediaSource.Factory(
@@ -96,20 +84,20 @@ class TvhSession(
 
     private val prewarmer = if (useHtsp) NeighbourPrewarmer(context, client, ::connectHtsp) else null
 
-    // No tunneled playback: on the Chromecast it started audio up to ~2 s before the first picture
-    // on most channels and failed on mono audio, with no measurable smoothness gain.
-    // Dolby passthrough, chosen per track in the TV app's audio menu and remembered (see onSelectTrack).
-    private val audioPrefs = context.getSharedPreferences("tvh_audio", Context.MODE_PRIVATE)
-    @Volatile private var passthrough = audioPrefs.getBoolean(PREF_PASSTHROUGH, false)
+    private val audioOutput = AudioOutput(context)
+    private val trackMenu = TrackMenu(context, audioOutput)
+    private var lastTracks = Tracks.EMPTY
     private val trackSelector = object : DefaultTrackSelector(context) {
         /** Re-runs track selection, so the audio renderers are asked again whether they can play it. */
         fun reselect() = invalidate()
     }
 
+    // No tunneled playback: on the Chromecast it started audio up to ~2 s before the first picture
+    // on most channels and failed on mono audio, with no measurable smoothness gain.
     private val player: ExoPlayer = ExoPlayer.Builder(context)
         .setTrackSelector(trackSelector)
         .setRenderersFactory(
-            FreshVideoDecoderRenderersFactory(context) { passthrough }.setEnableDecoderFallback(true)
+            PlaybackRenderersFactory(context, audioOutput).setEnableDecoderFallback(true)
                 // Broadcast audio is often MP2/AC3; fall back to FFmpeg when the platform can't decode it.
                 .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
                 .setMediaCodecSelector { mime, secure, tunneling ->
@@ -208,6 +196,7 @@ class TvhSession(
         currentChannelUri = channelUri
         currentChannelUuid = uuid
         retries = 0
+        trackMenu.dualMonoSecond = false
         showStatus(null)
         handler.removeCallbacksAndMessages(null)
         notifyVideoUnavailable(TvInputManager.VIDEO_UNAVAILABLE_REASON_TUNING)
@@ -296,6 +285,7 @@ class TvhSession(
         syncedFrameShown = false
         firstFrameRendered = false
         handler.removeCallbacks(revealTimeout)
+        trackMenu.reset()
         val uri = if (useHtsp) "htsp://channel/${client.htspChannelId(uuid)}" else client.streamUrl(uuid)
         Log.i(TAG, "Playing $uri")
         val source = mediaSourceFactory.createMediaSource(MediaItem.fromUri(uri))
@@ -342,39 +332,30 @@ class TvhSession(
     }
 
     override fun onSelectTrack(type: Int, trackId: String?): Boolean {
-        val trackType = when (type) {
-            TvTrackInfo.TYPE_AUDIO -> C.TRACK_TYPE_AUDIO
-            TvTrackInfo.TYPE_VIDEO -> C.TRACK_TYPE_VIDEO
-            TvTrackInfo.TYPE_SUBTITLE -> C.TRACK_TYPE_TEXT
-            else -> return false
-        }
+        val trackType = TrackMenu.trackType(type) ?: return false
         val params = player.trackSelectionParameters.buildUpon()
-        var wantPassthrough = passthrough
+        var passthroughChanged = false
         if (trackId == null) {
             params.setTrackTypeDisabled(trackType, true)
         } else {
             // The id comes from the TV app: reject anything we didn't hand out instead of crashing.
-            val dolby = trackId.endsWith(PASSTHROUGH_SUFFIX)
-            val parts = trackId.removeSuffix(PASSTHROUGH_SUFFIX).split(':').mapNotNull { it.toIntOrNull() }
-            if (parts.size != 2) return false
-            val (groupIndex, trackIndex) = parts
-            val group = player.currentTracks.groups.getOrNull(groupIndex) ?: return false
-            if (group.type != trackType || trackIndex !in 0 until group.length) return false
-            if (dolby && !canPassthrough(group.getTrackFormat(trackIndex))) return false
-            // Picking a Dolby entry turns passthrough on, picking any other audio track turns it off.
-            if (type == TvTrackInfo.TYPE_AUDIO) wantPassthrough = dolby
+            val choice = trackMenu.resolve(player.currentTracks, trackType, trackId) ?: return false
+            if (trackType == C.TRACK_TYPE_AUDIO) {
+                // A Dolby entry turns passthrough on, any other audio entry turns it off.
+                val passthrough = choice.variant == TrackMenu.Variant.PASSTHROUGH
+                passthroughChanged = passthrough != audioOutput.passthrough
+                if (passthroughChanged) Log.i(TAG, "Dolby passthrough ${if (passthrough) "on" else "off"}")
+                audioOutput.passthrough = passthrough
+                trackMenu.dualMonoSecond = choice.variant == TrackMenu.Variant.DUAL_MONO_SECOND
+            }
             params.setTrackTypeDisabled(trackType, false)
-                .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, trackIndex))
-        }
-        val passthroughChanged = wantPassthrough != passthrough
-        if (passthroughChanged) {
-            Log.i(TAG, "Dolby passthrough ${if (wantPassthrough) "on" else "off"}")
-            passthrough = wantPassthrough
-            audioPrefs.edit().putBoolean(PREF_PASSTHROUGH, wantPassthrough).apply()
+                .setOverrideForType(TrackSelectionOverride(choice.group.mediaTrackGroup, choice.trackIndex))
         }
         player.trackSelectionParameters = params.build()
         // Same track, other output: the audio renderers must be asked again (passthrough or FFmpeg).
         if (passthroughChanged) trackSelector.reselect()
+        // The dual-mono side applies at once (same track, no reselection needed).
+        audioOutput.dualMono.mode = trackMenu.dualMonoMode(lastTracks)
         notifyTrackSelected(type, trackId)
         return true
     }
@@ -577,150 +558,42 @@ class TvhSession(
     }
 
     override fun onTracksChanged(tracks: Tracks) {
-        val infos = ArrayList<TvTrackInfo>()
-        val selected = HashMap<Int, String>()
-        tracks.groups.forEachIndexed { groupIndex, group ->
-            val tvType = when (group.type) {
-                C.TRACK_TYPE_AUDIO -> TvTrackInfo.TYPE_AUDIO
-                C.TRACK_TYPE_VIDEO -> TvTrackInfo.TYPE_VIDEO
-                C.TRACK_TYPE_TEXT -> TvTrackInfo.TYPE_SUBTITLE
-                else -> return@forEachIndexed
-            }
-            for (i in 0 until group.length) {
-                if (!group.isTrackSupported(i)) continue
-                val f = group.getTrackFormat(i)
-                val id = "$groupIndex:$i"
-                val b = TvTrackInfo.Builder(tvType, id)
-                f.language?.let { b.setLanguage(it) }
-                f.label?.let { b.setDescription(it) }
-                when (tvType) {
-                    TvTrackInfo.TYPE_AUDIO -> {
-                        if (f.channelCount > 0) b.setAudioChannelCount(f.channelCount)
-                        if (f.sampleRate > 0) b.setAudioSampleRate(f.sampleRate)
-                    }
-                    TvTrackInfo.TYPE_VIDEO -> {
-                        if (f.width > 0) b.setVideoWidth(f.width)
-                        if (f.height > 0) b.setVideoHeight(f.height)
-                        if (f.frameRate > 0) b.setVideoFrameRate(f.frameRate)
-                        if (f.pixelWidthHeightRatio > 0) b.setVideoPixelAspectRatio(f.pixelWidthHeightRatio)
-                    }
-                }
-                infos += b.build()
-                val dolby = tvType == TvTrackInfo.TYPE_AUDIO && canPassthrough(f)
-                if (dolby) {
-                    // The same track again, sent undecoded to the TV/receiver: "Italiano · Dolby Digital".
-                    val ptId = id + PASSTHROUGH_SUFFIX
-                    infos += TvTrackInfo.Builder(TvTrackInfo.TYPE_AUDIO, ptId).apply {
-                        f.language?.let { setLanguage(it) }
-                        setDescription(passthroughLabel(f))
-                        if (f.channelCount > 0) setAudioChannelCount(f.channelCount)
-                        if (f.sampleRate > 0) setAudioSampleRate(f.sampleRate)
-                    }.build()
-                    if (group.isTrackSelected(i) && passthrough) selected[tvType] = ptId
-                }
-                if (group.isTrackSelected(i) && selected[tvType] == null) selected[tvType] = id
-            }
-        }
-        Log.i(TAG, "Audio tracks: " + infos.filter { it.type == TvTrackInfo.TYPE_AUDIO }.joinToString {
-            "${it.id}=${it.language}${it.description?.let { d -> " \"$d\"" } ?: ""}"
-        } + ", selected ${selected[TvTrackInfo.TYPE_AUDIO]}")
-        notifyTracksChanged(infos)
-        for (type in listOf(TvTrackInfo.TYPE_AUDIO, TvTrackInfo.TYPE_VIDEO, TvTrackInfo.TYPE_SUBTITLE)) {
-            notifyTrackSelected(type, selected[type])
-        }
-    }
-
-    /** Whether [f] is Dolby audio the HDMI output accepts undecoded. */
-    private fun canPassthrough(f: Format): Boolean {
-        val encoding = when (f.sampleMimeType) {
-            MimeTypes.AUDIO_AC3 -> C.ENCODING_AC3
-            MimeTypes.AUDIO_E_AC3, MimeTypes.AUDIO_E_AC3_JOC -> C.ENCODING_E_AC3
-            else -> return false
-        }
-        return try {
-            AudioCapabilities.getCapabilities(context, AudioAttributes.DEFAULT, null).supportsEncoding(encoding)
-        } catch (e: RuntimeException) {
-            false
-        }
-    }
-
-    /** "Italiano · Dolby Digital 5.1": the language too, as TV apps show the description instead of it. */
-    private fun passthroughLabel(f: Format): String {
-        val language = f.language?.takeIf { it != "und" && it != "mul" }
-            ?.let { Locale.forLanguageTag(it).displayLanguage.replaceFirstChar { c -> c.titlecase() } }
-            ?.takeIf { it.isNotBlank() }
-        val codec = if (f.sampleMimeType == MimeTypes.AUDIO_AC3) "Dolby Digital" else "Dolby Digital Plus"
-        val layout = when (f.channelCount) {
-            6 -> " 5.1"
-            8 -> " 7.1"
-            else -> ""
-        }
-        return listOfNotNull(language, codec + layout).joinToString(" · ")
+        lastTracks = tracks
+        publishTracks()
     }
 
     /**
-     * Creates a new video decoder whenever the video format changes, i.e. on every zap, instead of
-     * flushing and reusing it. A reused Amlogic decoder got stuck in a "resolution changing" state
-     * after the first zap and logged ~40 errors/s for as long as the channel played.
+     * The picture's real size and aspect: the TV app sizes the picture from the track info, which
+     * is otherwise only sent at tune-in, so a 4:3 <-> 16:9 switch mid-programme must resend it.
      */
-    private class FreshVideoDecoderRenderersFactory(
-        context: Context,
-        private val passthrough: () -> Boolean,
-    ) : DefaultRenderersFactory(context) {
-        override fun buildVideoRenderers(
-            context: Context,
-            extensionRendererMode: Int,
-            mediaCodecSelector: MediaCodecSelector,
-            enableDecoderFallback: Boolean,
-            eventHandler: Handler,
-            eventListener: VideoRendererEventListener,
-            allowedVideoJoiningTimeMs: Long,
-            out: ArrayList<Renderer>,
-        ) {
-            super.buildVideoRenderers(
-                context, extensionRendererMode, mediaCodecSelector, enableDecoderFallback,
-                eventHandler, eventListener, allowedVideoJoiningTimeMs, out,
-            )
-            val index = out.indexOfFirst { it is MediaCodecVideoRenderer }
-            if (index < 0) return
-            val builder = MediaCodecVideoRenderer.Builder(context)
-                .setCodecAdapterFactory(codecAdapterFactory)
-                .setMediaCodecSelector(mediaCodecSelector)
-                .setAllowedJoiningTimeMs(allowedVideoJoiningTimeMs)
-                .setEnableDecoderFallback(enableDecoderFallback)
-                .setEventHandler(eventHandler)
-                .setEventListener(eventListener)
-                .setMaxDroppedFramesToNotify(MAX_DROPPED_VIDEO_FRAME_COUNT_TO_NOTIFY)
-            out[index] = object : MediaCodecVideoRenderer(builder) {
-                override fun canReuseCodec(codecInfo: MediaCodecInfo, oldFormat: Format, newFormat: Format) =
-                    DecoderReuseEvaluation(
-                        codecInfo.name, oldFormat, newFormat,
-                        DecoderReuseEvaluation.REUSE_RESULT_NO, DecoderReuseEvaluation.DISCARD_REASON_APP_OVERRIDE,
-                    )
-            }
+    override fun onVideoSizeChanged(videoSize: VideoSize) {
+        if (videoSize.width <= 0 || videoSize.height <= 0) return // surface going away
+        val previous = trackMenu.videoSize
+        if (videoSize == previous) return
+        trackMenu.videoSize = videoSize
+        if (previous != null) Log.i(TAG, "Picture now ${videoSize.width}x${videoSize.height} par=${videoSize.pixelWidthHeightRatio}")
+        publishTracks()
+    }
+
+    /** Tells the TV app about the tracks of [lastTracks] (see [onTracksChanged]). */
+    private fun publishTracks() {
+        val menu = trackMenu.build(lastTracks)
+        Log.d(TAG, "Audio menu: " + menu.tracks.filter { it.type == TvTrackInfo.TYPE_AUDIO }.joinToString {
+            "${it.id}=${it.language}${it.description?.let { d -> " \"$d\"" } ?: ""}"
+        } + ", selected ${menu.selected[TvTrackInfo.TYPE_AUDIO]}")
+        notifyTracksChanged(menu.tracks)
+        for (type in listOf(TvTrackInfo.TYPE_AUDIO, TvTrackInfo.TYPE_VIDEO, TvTrackInfo.TYPE_SUBTITLE)) {
+            notifyTrackSelected(type, menu.selected[type])
         }
+        audioOutput.dualMono.mode = trackMenu.dualMonoMode(lastTracks)
+    }
 
-        /**
-         * PCM output unless the user picked a "Dolby Digital" track (passthrough): AC3/E-AC3 get
-         * decoded here (FFmpeg) like MP2. Sent as a bitstream, the TV or receiver muted while
-         * switching to Dolby, so the sound started audibly after the picture even though the
-         * player's audio clock was already running; fine for those who want surround on a receiver.
-         */
-        override fun buildAudioSink(
-            context: Context,
-            enableFloatOutput: Boolean,
-            enableAudioOutputPlaybackParams: Boolean,
-        ): AudioSink {
-            val sink = super.buildAudioSink(context, enableFloatOutput, enableAudioOutputPlaybackParams)
-                ?: DefaultAudioSink.Builder(context).build()
-            return object : ForwardingAudioSink(sink) {
-                override fun getFormatSupport(format: Format): Int =
-                    if (format.sampleMimeType != MimeTypes.AUDIO_RAW && !passthrough()) AudioSink.SINK_FORMAT_UNSUPPORTED
-                    else super.getFormatSupport(format)
-
-                override fun supportsFormat(format: Format) =
-                    getFormatSupport(format) != AudioSink.SINK_FORMAT_UNSUPPORTED
-            }
+    /** Called (on the loading thread) by the extractor when an MP2 stream enters or leaves dual mono. */
+    private fun onDualMono(streamId: String?, dual: Boolean) {
+        handler.post {
+            val id = streamId ?: return@post
+            val streams = trackMenu.dualMonoStreams
+            if (if (dual) streams.add(id) else streams.remove(id)) publishTracks()
         }
     }
 
@@ -730,9 +603,6 @@ class TvhSession(
         const val RETRY_DELAY_MS = 2000L
         const val SURFACE_RESTORE_DELAY_MS = 1000L
         const val REVEAL_TIMEOUT_MS = 2000L
-        const val PREF_PASSTHROUGH = "dolby_passthrough"
-        /** Track id suffix of the "Dolby Digital" (passthrough) twin of an AC3/E-AC3 track. */
-        const val PASSTHROUGH_SUFFIX = ":dolby"
         const val BUFFERING_NOTIFY_DELAY_MS = 1000L
         const val PREWARM_DELAY_MS = 2000L
         /** Re-checks the rating at least this often, e.g. when the guide arrives after the tune. */

@@ -7,11 +7,9 @@ import androidx.media3.common.ColorInfo
 import androidx.media3.common.Format
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.util.CodecSpecificDataUtil
-import androidx.media3.common.util.ParsableBitArray
 import androidx.media3.common.util.ParsableByteArray
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.container.NalUnitUtil
-import androidx.media3.extractor.Ac3Util
 import androidx.media3.extractor.Extractor
 import androidx.media3.extractor.ExtractorInput
 import androidx.media3.extractor.ExtractorOutput
@@ -27,14 +25,25 @@ import kotlin.math.abs
  * elementary streams, each `muxpkt` carries one already-demuxed frame of one stream.
  */
 @OptIn(UnstableApi::class)
-class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) : Extractor {
+class HtspExtractor(
+    private val subtitleParserFactory: SubtitleParser.Factory,
+    /** Told (on the loading thread) when an MP2 stream, by format id, enters or leaves dual mono. */
+    private val onDualMono: (streamId: String?, dual: Boolean) -> Unit = { _, _ -> },
+) : Extractor {
 
     private class Track(val output: TrackOutput, val codec: String, var format: Format) {
         val video = isVideo(codec)
-        val aac = codec == "AAC"
+        val name = "Stream ${format.id} ($codec)"
+        val audio = if (MimeTypes.isAudio(format.sampleMimeType)) AudioFrameReader(codec, name) else null
+        val aspect = if (video) VideoAspectReader(codec, name) else null
+        val gaps = TimestampGaps(name)
 
-        /** AC3/E-AC3 whose bitrate is still unknown (see [declareDolbyBitrate]). */
-        var dolbyBitratePending = codec == "AC3" || codec == "EAC3"
+        /** Declares [newFormat] if it differs from the current one (Media3 then adapts the decoder). */
+        fun update(newFormat: Format) {
+            if (newFormat === format) return
+            format = newFormat
+            output.format(newFormat)
+        }
 
         // A video picture whose data is written but not yet committed, in case the next packet
         // is its second field (see onPacket).
@@ -51,12 +60,6 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
         var formatPending = false
         var sps: ByteArray? = null
         var pps: ByteArray? = null
-
-        // Timestamp continuity, to log packets lost before they reached us (see checkContinuity).
-        var expectedUs = C.TIME_UNSET
-        var gaps = 0
-        var missingUs = 0L
-        var lastGapLogNs = 0L
     }
 
     private lateinit var extractorOutput: ExtractorOutput
@@ -125,6 +128,7 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
         if (started) return
         for (stream in msg.list("streams")) {
             stream as HtsMsg
+            Log.d(TAG, "From tvheadend: $stream")
             val index = stream.int("index") ?: continue
             val codec = stream.str("type") ?: continue
             val format = formatFor(index, codec, stream) ?: continue
@@ -136,9 +140,7 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
             // be used: it puts it on the top-level message.
             if (codec == "H264") track.formatPending = true else output.format(format)
             tracks[index] = track
-            val video = if (isVideo(codec)) {
-                " ${format.width}x${format.height} aspect=${stream.int("aspect_num")}:${stream.int("aspect_den")} par=${format.pixelWidthHeightRatio}"
-            } else ""
+            val video = if (track.video) " ${format.width}x${format.height} par=${format.pixelWidthHeightRatio}" else ""
             Log.i(TAG, "Stream $index: $codec ${format.sampleMimeType} ${format.language ?: ""}$video")
         }
         extractorOutput.endTracks()
@@ -146,36 +148,11 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
         started = true
     }
 
-    /**
-     * Each packet should start where the previous one of its stream ended (decode time +
-     * duration). A jump forward means packets were lost upstream (reception, tvheadend); logged at
-     * most once a second per stream, with what was missed since, so bad reception doesn't flood.
-     */
-    private fun checkContinuity(stream: Int, track: Track, dtsUs: Long, durationUs: Long) {
-        val expected = track.expectedUs
-        track.expectedUs = if (durationUs > 0) dtsUs + durationUs else C.TIME_UNSET
-        if (expected != C.TIME_UNSET) {
-            val gapUs = dtsUs - expected
-            // Video fields are half a frame apart, so only jumps well beyond a frame count.
-            if (gapUs >= maxOf(GAP_MIN_US, durationUs * 2) || gapUs <= -GAP_MIN_US) {
-                track.gaps++
-                track.missingUs += gapUs
-            }
-        }
-        if (track.gaps == 0) return
-        val now = System.nanoTime()
-        if (now - track.lastGapLogNs < GAP_LOG_INTERVAL_NS) return // reported with the next line
-        track.lastGapLogNs = now
-        Log.w(TAG, "Stream $stream (${track.codec}): ${track.gaps} timestamp jump(s), ${track.missingUs / 1000} ms in total")
-        track.gaps = 0
-        track.missingUs = 0
-    }
-
     /** One muxpkt; its payload is `body[offset, offset + size)`. Times are in µs. */
     private fun onPacket(stream: Int, timestamp: Long, dts: Long, duration: Long, frameType: Int, offset: Int, size: Int) {
         val track = tracks[stream] ?: return
         val keyFrame = !track.video || frameType == 'I'.code
-        checkContinuity(stream, track, dts, duration)
+        track.gaps.check(dts, duration)
 
         // Packets are passed through as they arrive, except video before its first keyframe and
         // the "leading" B-frames that follow it but show before it: they reference the previous
@@ -193,20 +170,20 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
         }
         if (baseTimeUs == C.TIME_UNSET) baseTimeUs = timestamp
 
-        var start = offset
-        if (track.aac) {
-            val skip = adtsHeaderSize(track, offset, size)
-            if (skip < 0) return
-            start += skip
+        val audio = track.audio
+        if (audio != null) {
+            val wasDualMono = audio.dualMono
+            track.update(audio.read(track.format, body, offset, size))
+            if (audio.skip < 0) return
+            if (audio.dualMono != wasDualMono) onDualMono(track.format.id, audio.dualMono)
+            val sampleSize = size - audio.skip
+            writeSample(track, offset + audio.skip, sampleSize)
+            commitSample(track, timestamp - baseTimeUs, C.BUFFER_FLAG_KEY_FRAME, sampleSize)
+            return
         }
-        if (track.dolbyBitratePending) declareDolbyBitrate(track, offset, size)
-        val sampleSize = offset + size - start
-        sample.reset(body, start + sampleSize)
-        sample.setPosition(start)
-
-        if (!track.video) {
-            track.output.sampleData(sample, sampleSize)
-            track.output.sampleMetadata(timestamp - baseTimeUs, if (keyFrame) C.BUFFER_FLAG_KEY_FRAME else 0, sampleSize, 0, null)
+        if (!track.video) { // subtitles
+            writeSample(track, offset, size)
+            commitSample(track, timestamp - baseTimeUs, C.BUFFER_FLAG_KEY_FRAME, size)
             return
         }
 
@@ -219,12 +196,16 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
             (!keyFrame || track.pendingKeyFrame) &&
             abs((dts - track.pendingDtsUs) * 2 - track.pendingDurationUs) <= FIELD_TOLERANCE_US
         if (!secondField) commitPending(track)
-        track.output.sampleData(sample, sampleSize)
+        // After committing the previous picture, so a new picture shape applies from this keyframe on.
+        if (keyFrame && !secondField && !track.formatPending) {
+            track.aspect?.let { track.update(it.read(track.format, body, offset, size)) }
+        }
+        writeSample(track, offset, size)
         if (secondField) {
-            track.pendingSize += sampleSize
+            track.pendingSize += size
             commitPending(track)
         } else {
-            track.pendingSize = sampleSize
+            track.pendingSize = size
             track.pendingTimeUs = timestamp - baseTimeUs
             track.pendingDtsUs = dts
             track.pendingDurationUs = duration
@@ -232,39 +213,32 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
         }
     }
 
+    private fun writeSample(track: Track, start: Int, size: Int) {
+        sample.reset(body, start + size)
+        sample.setPosition(start)
+        track.output.sampleData(sample, size)
+    }
+
+    private fun commitSample(track: Track, timeUs: Long, flags: Int, size: Int) {
+        track.output.sampleMetadata(timeUs, flags, size, 0, null)
+    }
+
     private fun commitPending(track: Track) {
         if (track.pendingSize == 0) return
         val flags = if (track.pendingKeyFrame) C.BUFFER_FLAG_KEY_FRAME else 0
-        track.output.sampleMetadata(track.pendingTimeUs, flags, track.pendingSize, 0, null)
+        commitSample(track, track.pendingTimeUs, flags, track.pendingSize)
         track.pendingSize = 0
     }
 
     /** Keeps the latest SPS and PPS (with a 3-byte start code, as Media3 expects) from `body[offset, offset + size)`. */
     private fun collectParameterSets(track: Track, offset: Int, size: Int) {
-        val limit = offset + size
-        var i = findStartCode(offset, limit)
-        while (i < limit) {
-            val nal = i + 3
-            val next = findStartCode(nal, limit)
-            var end = next
-            while (end > nal && body[end - 1].toInt() == 0) end-- // zero byte of a 4-byte start code
-            if (end > nal) {
-                when (body[nal].toInt() and 0x1f) {
-                    7 -> track.sps = body.copyOfRange(i, end)
-                    8 -> track.pps = body.copyOfRange(i, end)
-                }
+        StartCodes.forEachH264Nal(body, offset, size) { start, end, type ->
+            when (type) {
+                NAL_SPS -> track.sps = body.copyOfRange(start, end)
+                NAL_PPS -> track.pps = body.copyOfRange(start, end)
             }
-            i = next
+            true
         }
-    }
-
-    private fun findStartCode(from: Int, limit: Int): Int {
-        var i = from
-        while (i + 2 < limit) {
-            if (body[i].toInt() == 0 && body[i + 1].toInt() == 0 && body[i + 2].toInt() == 1) return i
-            i++
-        }
-        return limit
     }
 
     /** Declares an H.264 track's format, with codec config from its SPS/PPS when both were seen. */
@@ -307,58 +281,6 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
         for (track in tracks.values) if (track.formatPending) declareFormat(track)
     }
 
-    /**
-     * Declares the real bitrate of an AC3/E-AC3 track from its first syncframe. Without it Media3
-     * sizes the passthrough AudioTrack for the codec's maximum rate (192 kB for E-AC3, ~11 s of a
-     * typical 140 kbit/s DVB-T stream), and TVs that only start a direct output once that buffer
-     * is full stayed silent on a frozen first frame for that long after every zap.
-     */
-    private fun declareDolbyBitrate(track: Track, offset: Int, size: Int) {
-        track.dolbyBitratePending = false
-        if (size < 8 || body[offset] != 0x0b.toByte() || body[offset + 1] != 0x77.toByte()) return
-        val info = try {
-            Ac3Util.parseAc3SyncframeInfo(ParsableBitArray(body).apply { setPosition(offset * 8) })
-        } catch (e: RuntimeException) {
-            Log.w(TAG, "Unparseable ${track.codec} syncframe", e)
-            return
-        }
-        if (info.bitrate <= 0 || info.frameSize <= 0) return
-        // A packet can hold several syncframes (e.g. E-AC3 dependent substreams): scale to all of it.
-        val bitrate = (info.bitrate.toLong() * size / info.frameSize).toInt()
-        // The syncframe also has the real layout (5.1 = 6 with LFE), which TV apps show per track.
-        val channels = info.channelCount.takeIf { it > 0 } ?: track.format.channelCount
-        Log.i(TAG, "${track.codec} bitrate ${bitrate / 1000} kbit/s, $channels channels")
-        track.format = track.format.buildUpon().setAverageBitrate(bitrate).setChannelCount(channels).build()
-        track.output.format(track.format)
-    }
-
-    /**
-     * tvheadend delivers AAC (including converted LATM) as ADTS frames, while decoders want raw
-     * frames plus an AudioSpecificConfig: returns how many header bytes to skip (-1 to drop the
-     * frame) and keeps the config in sync with the header.
-     */
-    private fun adtsHeaderSize(track: Track, offset: Int, size: Int): Int {
-        val b = body
-        if (size < 7 || b[offset] != 0xff.toByte() || (b[offset + 1].toInt() and 0xf0) != 0xf0) return 0
-        val headerSize = if (b[offset + 1].toInt() and 0x01 == 0) 9 else 7 // protection_absent == 0 adds a CRC
-        if (size <= headerSize) return -1
-        val objectType = ((b[offset + 2].toInt() shr 6) and 0x03) + 1
-        val rateIndex = (b[offset + 2].toInt() shr 2) and 0x0f
-        val channelConfig = ((b[offset + 2].toInt() and 0x01) shl 2) or ((b[offset + 3].toInt() shr 6) and 0x03)
-        val current = track.format.initializationData.firstOrNull()
-        val config0 = ((objectType shl 3) or (rateIndex shr 1)).toByte()
-        val config1 = (((rateIndex and 0x01) shl 7) or (channelConfig shl 3)).toByte()
-        if (current == null || current.size != 2 || current[0] != config0 || current[1] != config1) {
-            track.format = track.format.buildUpon()
-                .setInitializationData(listOf(audioSpecificConfig(objectType, rateIndex, channelConfig)))
-                .setSampleRate(SAMPLE_RATES.getOrElse(rateIndex) { track.format.sampleRate })
-                .setChannelCount(if (channelConfig in 1..6) channelConfig else track.format.channelCount)
-                .build()
-            track.output.format(track.format)
-        }
-        return headerSize
-    }
-
     private fun formatFor(index: Int, codec: String, stream: HtsMsg): Format? {
         val builder = Format.Builder().setId(index).setLanguage(stream.str("language"))
         val rateIndex = stream.int("rate") ?: 3 // tvheadend sends the AAC-style sample rate index
@@ -371,7 +293,7 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
             "AC3" -> builder.setSampleMimeType(MimeTypes.AUDIO_AC3)
             "EAC3" -> builder.setSampleMimeType(MimeTypes.AUDIO_E_AC3)
             "AAC" -> builder.setSampleMimeType(MimeTypes.AUDIO_AAC)
-                .setInitializationData(listOf(audioSpecificConfig(2, rateIndex, channels)))
+                .setInitializationData(listOf(AudioFrameReader.audioSpecificConfig(2, rateIndex, channels)))
             "DVBSUB" -> {
                 val composition = stream.int("composition_id") ?: 0
                 val ancillary = stream.int("ancillary_id") ?: 0
@@ -402,15 +324,17 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
             // Frame duration in µs.
             stream.int("duration")?.takeIf { it > 0 }?.let { builder.setFrameRate(1_000_000f / it) }
         } else if (codec != "DVBSUB") {
-            builder.setChannelCount(channels).setSampleRate(SAMPLE_RATES.getOrElse(rateIndex) { 48000 })
+            builder.setChannelCount(channels).setSampleRate(AudioFrameReader.SAMPLE_RATES.getOrElse(rateIndex) { 48000 })
+            // DVB's ISO 639 audio_type: so the player doesn't pick an audio-description track by
+            // default, and TV apps can mark it.
+            when (stream.int("audio_type")) {
+                1 -> builder.setRoleFlags(C.ROLE_FLAG_ALTERNATE) // clean effects
+                2 -> builder.setRoleFlags(C.ROLE_FLAG_ENHANCED_DIALOG_INTELLIGIBILITY) // hearing impaired
+                3 -> builder.setRoleFlags(C.ROLE_FLAG_DESCRIBES_VIDEO) // visual impaired commentary
+            }
         }
         return builder.build()
     }
-
-    private fun audioSpecificConfig(objectType: Int, rateIndex: Int, channelConfig: Int) = byteArrayOf(
-        ((objectType shl 3) or (rateIndex shr 1)).toByte(),
-        (((rateIndex and 0x01) shl 7) or (channelConfig shl 3)).toByte(),
-    )
 
     override fun seek(position: Long, timeUs: Long) {
         // Live only.
@@ -420,12 +344,11 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
 
     private companion object {
         const val TAG = "HtspExtractor"
-        val SAMPLE_RATES = intArrayOf(96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350)
         const val NONE = Long.MIN_VALUE
         const val FORMAT_WAIT_US = 3_000_000L
         const val FIELD_TOLERANCE_US = 2L // 90 kHz -> µs rounding
-        const val GAP_MIN_US = 100_000L
-        const val GAP_LOG_INTERVAL_NS = 1_000_000_000L
+        const val NAL_SPS = 7
+        const val NAL_PPS = 8
         val METHOD = HtsFieldReader.name("method")
         val STREAM = HtsFieldReader.name("stream")
         val PTS = HtsFieldReader.name("pts")
