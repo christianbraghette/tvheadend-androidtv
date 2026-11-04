@@ -62,6 +62,9 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
 
     /** When the last message arrived: a connection that went silent is checked with a ping. */
     @Volatile private var lastReceivedNs = System.nanoTime()
+    /** Messages read so far, of any kind: lets a subscription tell a stalled stream from a stalled link. */
+    @Volatile var messagesReceived = 0L
+        private set
     private val pingInFlight = AtomicBoolean()
     private var watchdog: ScheduledFuture<*>? = null
 
@@ -167,6 +170,7 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
             while (!isClosed) {
                 val length = input.readInt()
                 lastReceivedNs = System.nanoTime()
+                messagesReceived++ // only the reader thread writes it
                 if (length < 0 || length > MAX_MESSAGE) throw IOException("Bad HTSP message length $length")
                 val body = BufferPool.obtain(length)
                 input.readFully(body, 0, length)

@@ -51,6 +51,12 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
         var formatPending = false
         var sps: ByteArray? = null
         var pps: ByteArray? = null
+
+        // Timestamp continuity, to log packets lost before they reached us (see checkContinuity).
+        var expectedUs = C.TIME_UNSET
+        var gaps = 0
+        var missingUs = 0L
+        var lastGapLogNs = 0L
     }
 
     private lateinit var extractorOutput: ExtractorOutput
@@ -140,10 +146,36 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
         started = true
     }
 
+    /**
+     * Each packet should start where the previous one of its stream ended (decode time +
+     * duration). A jump forward means packets were lost upstream (reception, tvheadend); logged at
+     * most once a second per stream, with what was missed since, so bad reception doesn't flood.
+     */
+    private fun checkContinuity(stream: Int, track: Track, dtsUs: Long, durationUs: Long) {
+        val expected = track.expectedUs
+        track.expectedUs = if (durationUs > 0) dtsUs + durationUs else C.TIME_UNSET
+        if (expected != C.TIME_UNSET) {
+            val gapUs = dtsUs - expected
+            // Video fields are half a frame apart, so only jumps well beyond a frame count.
+            if (gapUs >= maxOf(GAP_MIN_US, durationUs * 2) || gapUs <= -GAP_MIN_US) {
+                track.gaps++
+                track.missingUs += gapUs
+            }
+        }
+        if (track.gaps == 0) return
+        val now = System.nanoTime()
+        if (now - track.lastGapLogNs < GAP_LOG_INTERVAL_NS) return // reported with the next line
+        track.lastGapLogNs = now
+        Log.w(TAG, "Stream $stream (${track.codec}): ${track.gaps} timestamp jump(s), ${track.missingUs / 1000} ms in total")
+        track.gaps = 0
+        track.missingUs = 0
+    }
+
     /** One muxpkt; its payload is `body[offset, offset + size)`. Times are in µs. */
     private fun onPacket(stream: Int, timestamp: Long, dts: Long, duration: Long, frameType: Int, offset: Int, size: Int) {
         val track = tracks[stream] ?: return
         val keyFrame = !track.video || frameType == 'I'.code
+        checkContinuity(stream, track, dts, duration)
 
         // Packets are passed through as they arrive, except video before its first keyframe and
         // the "leading" B-frames that follow it but show before it: they reference the previous
@@ -390,6 +422,8 @@ class HtspExtractor(private val subtitleParserFactory: SubtitleParser.Factory) :
         const val NONE = Long.MIN_VALUE
         const val FORMAT_WAIT_US = 3_000_000L
         const val FIELD_TOLERANCE_US = 2L // 90 kHz -> µs rounding
+        const val GAP_MIN_US = 100_000L
+        const val GAP_LOG_INTERVAL_NS = 1_000_000_000L
         val METHOD = HtsFieldReader.name("method")
         val STREAM = HtsFieldReader.name("stream")
         val PTS = HtsFieldReader.name("pts")

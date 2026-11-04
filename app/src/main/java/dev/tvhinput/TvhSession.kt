@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
 import android.graphics.Color
+import android.media.MediaCodec
 import android.media.tv.TvContentRating
 import android.media.tv.TvContract
 import android.media.tv.TvInputManager
@@ -121,6 +122,10 @@ class TvhSession(
     private var currentChannelUri: Uri? = null
     private var currentChannelUuid: String? = null
     private var retries = 0
+    /** The surface the TV app gave us last. */
+    private var surface: Surface? = null
+    /** The last surface the decoder failed on: it's tried again only once. */
+    private var failedSurface: Surface? = null
     /** Counts play() calls, so a delayed action can tell its playback was replaced. */
     private var playToken = 0
     private var prewarmedToken = -1
@@ -254,8 +259,25 @@ class TvhSession(
         )?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
 
     override fun onSetSurface(surface: Surface?): Boolean {
+        this.surface = surface
+        handler.removeCallbacks(restoreSurface)
         player.setVideoSurface(surface)
         return true
+    }
+
+    /**
+     * The TV app's surface can die (Home pressed, activity stopped) before its onSetSurface(null)
+     * reaches us, and the decoder then fails on the next frame. That's no playback problem: keep
+     * playing without video and give the picture back when the app hands us a surface again.
+     */
+    private fun isSurfaceLost(error: PlaybackException): Boolean =
+        generateSequence<Throwable>(error) { it.cause }
+            .filterIsInstance<MediaCodec.CodecException>()
+            .any { it.message.orEmpty().contains("surface", ignoreCase = true) }
+
+    /** If the app never sends a new surface, the old one may still be fine: try it again. */
+    private val restoreSurface = Runnable {
+        if (!released) player.setVideoSurface(surface)
     }
 
     override fun onSetStreamVolume(volume: Float) {
@@ -434,8 +456,17 @@ class TvhSession(
     }
 
     override fun onPlayerError(error: PlaybackException) {
-        Log.w(TAG, "Playback error: ${error.errorCodeName}", error)
         val uuid = currentChannelUuid ?: return
+        if (isSurfaceLost(error)) {
+            Log.i(TAG, "Video surface went away: continuing without it")
+            // Give a surface one second chance only, or a really dead one would fail forever.
+            if (surface != failedSurface) handler.postDelayed(restoreSurface, SURFACE_RESTORE_DELAY_MS)
+            failedSurface = surface
+            player.clearVideoSurface()
+            play(uuid)
+            return
+        }
+        Log.w(TAG, "Playback error: ${error.errorCodeName}", error)
         // tvheadend answers an HTTP stream request it can't serve (no free tuner, ...) with 503.
         val httpCode = generateSequence<Throwable>(error) { it.cause }
             .filterIsInstance<HttpDataSource.InvalidResponseCodeException>()
@@ -536,6 +567,7 @@ class TvhSession(
         const val TAG = "TvhSession"
         const val MAX_RETRIES = 3
         const val RETRY_DELAY_MS = 2000L
+        const val SURFACE_RESTORE_DELAY_MS = 1000L
         const val BUFFERING_NOTIFY_DELAY_MS = 1000L
         const val PREWARM_DELAY_MS = 2000L
         /** Re-checks the rating at least this often, e.g. when the guide arrives after the tune. */

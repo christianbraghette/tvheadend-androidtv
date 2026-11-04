@@ -36,7 +36,7 @@ class HtspGuide(private val client: TvhClient, private val listener: Listener) :
         fun onConnectionLost(error: IOException)
     }
 
-    private class Channel(val uuid: String, val major: Long, val minor: Long, val name: String, val icon: String?, val radio: Boolean)
+    private data class Channel(val uuid: String, val major: Long, val minor: Long, val name: String, val icon: String?, val radio: Boolean)
 
     private val channels = HashMap<Int, Channel>() // HTSP channel id -> channel
     /** Numbers given to channels without one in the initial dump, kept for their live updates. */
@@ -63,9 +63,11 @@ class HtspGuide(private val client: TvhClient, private val listener: Listener) :
         when (method) {
             "channelAdd", "channelUpdate" -> {
                 val id = msg.int("channelId") ?: return
-                val channel = parseChannel(id, msg) ?: return
+                val previous = channels[id]
+                val channel = parseChannel(id, msg, previous) ?: return
                 channels[id] = channel
-                if (initialDone) listener.onChannel(toTvhChannel(channel, fallbackNumbers[channel.uuid].orEmpty()), channel.radio)
+                // tvheadend resends channels on every now/next change: only pass on real changes.
+                if (initialDone && channel != previous) listener.onChannel(toTvhChannel(channel, fallbackNumbers[channel.uuid].orEmpty()), channel.radio)
             }
             "channelDelete" -> {
                 val channel = msg.int("channelId")?.let { channels.remove(it) } ?: return
@@ -112,16 +114,23 @@ class HtspGuide(private val client: TvhClient, private val listener: Listener) :
         icon = c.icon,
     )
 
-    private fun parseChannel(id: Int, msg: HtsMsg): Channel? {
-        val uuid = msg.str("channelIdStr") ?: uuidFromHttp(id) ?: return null
-        val content = msg.list("services").mapNotNull { (it as? HtsMsg)?.int("content") }
+    /**
+     * A channelAdd carries the whole channel, a channelUpdate only the fields that changed (often
+     * just the now/next event ids): fields it leaves out keep their [previous] value.
+     */
+    private fun parseChannel(id: Int, msg: HtsMsg, previous: Channel?): Channel? {
+        val uuid = msg.str("channelIdStr") ?: previous?.uuid ?: uuidFromHttp(id) ?: return null
+        val services = msg["services"] as? List<*>
+        val content = services?.mapNotNull { (it as? HtsMsg)?.int("content") }
+        val icon = msg.str("channelIcon")
         return Channel(
             uuid = uuid,
-            major = msg.long("channelNumber") ?: 0,
-            minor = msg.long("channelNumberMinor") ?: 0,
-            name = msg.str("channelName").orEmpty(),
-            icon = msg.str("channelIcon")?.takeIf { it.isNotBlank() },
-            radio = content.isNotEmpty() && content.all { it == SERVICE_CONTENT_RADIO },
+            major = msg.long("channelNumber") ?: previous?.major ?: 0,
+            minor = msg.long("channelNumberMinor") ?: previous?.minor ?: 0,
+            name = msg.str("channelName") ?: previous?.name.orEmpty(),
+            icon = if (icon != null) icon.takeIf { it.isNotBlank() } else previous?.icon,
+            radio = if (content != null) content.isNotEmpty() && content.all { it == SERVICE_CONTENT_RADIO }
+                else previous?.radio ?: false,
         )
     }
 
