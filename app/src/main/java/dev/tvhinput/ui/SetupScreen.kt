@@ -62,6 +62,7 @@ class SetupState(saved: TvhConfig?) {
     var profile by mutableStateOf(saved?.profile ?: "pass")
     var protocol by mutableStateOf(saved?.protocol ?: StreamProtocol.HTTP)
     var htspPort by mutableStateOf((saved?.htspPort ?: 9982).toString())
+    var prewarm by mutableStateOf(saved?.prewarm ?: false)
     var hostError by mutableStateOf(false)
     var status by mutableStateOf<SetupStatus?>(null)
     var syncing by mutableStateOf(false)
@@ -190,6 +191,18 @@ fun SetupScreen(state: SetupState, onConnect: () -> Unit) {
                         keyboardType = KeyboardType.Number,
                         imeAction = ImeAction.Done,
                         modifier = fieldGap,
+                    )
+                    SwitchRow(
+                        label = stringResource(R.string.prewarm),
+                        checked = state.prewarm,
+                        onCheckedChange = { state.prewarm = it },
+                        modifier = fieldGap,
+                    )
+                    Text(
+                        text = stringResource(R.string.prewarm_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = cs.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 4.dp, end = 4.dp, top = 8.dp),
                     )
                 } else {
                     TvTextField(

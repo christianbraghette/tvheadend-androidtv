@@ -11,7 +11,7 @@ regular TV source in Live Channels and in any other app that lists TV inputs.
 | `TvhInputService` / `TvhSession` | The TIF input. Plays a channel with Media3 ExoPlayer, over HTTP (`/stream/channel/{uuid}`, MPEG-TS) or HTSP, and reports audio/video/subtitle tracks to the TV app. |
 | `htsp/` | HTSP client: binary message codec, an authenticated connection shared by a session, and a `DataSource` + `Extractor` that feed subscription packets to ExoPlayer without copying or re-parsing them. |
 | `StartBufferTuner` / `LiveLoadControl` | Per-channel start buffer, learned from how low the buffer gets while watching: channels that arrive evenly start faster, ones that stall get more cushion. |
-| `NeighbourPrewarmer` | HTSP only: keeps the previous/next channel tuned at low priority when they are on another multiplex, with their streams switched off, so zapping to them skips the retune. Dropped after 2 minutes without zapping. |
+| `NeighbourPrewarmer` | HTSP only, off by default (setup option "Pre-tune neighbouring channels"): keeps the previous/next channel tuned at low priority when they are on another multiplex, with their streams switched off, so zapping to them skips the retune. Dropped after 2 minutes without zapping. |
 | `TvProviderSync` | Mirrors `/api/channel/grid` and `/api/epg/events/grid` into `TvContract.Channels` / `TvContract.Programs`, including channel logos and radio channel detection. |
 | `SyncWorker` | WorkManager job that refreshes channels and EPG every 6 hours. |
 | `SetupActivity` | Server settings. The TV app opens it when the source is added, and from its channel source settings later. |

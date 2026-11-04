@@ -19,6 +19,8 @@ data class TvhConfig(
     val profile: String = "pass",
     val protocol: StreamProtocol = StreamProtocol.HTTP,
     val htspPort: Int = 9982,
+    /** HTSP only: keep the neighbouring channels tuned (see NeighbourPrewarmer). Uses extra tuners. */
+    val prewarm: Boolean = false,
 )
 
 object Settings {
@@ -46,6 +48,7 @@ object Settings {
             protocol = runCatching { StreamProtocol.valueOf(p.getString("protocol", null)!!) }
                 .getOrDefault(StreamProtocol.HTTP),
             htspPort = p.getInt("htsp_port", 9982),
+            prewarm = p.getBoolean("prewarm", false),
         )
     }
 
@@ -61,6 +64,7 @@ object Settings {
             putString("profile", config.profile)
             putString("protocol", config.protocol.name)
             putInt("htsp_port", config.htspPort)
+            putBoolean("prewarm", config.prewarm)
         }
     }
 }

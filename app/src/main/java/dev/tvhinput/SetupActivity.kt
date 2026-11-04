@@ -52,6 +52,7 @@ class SetupActivity : ComponentActivity() {
             profile = state.profile.trim(),
             protocol = state.protocol,
             htspPort = state.htspPort.toIntOrNull() ?: 9982,
+            prewarm = state.prewarm,
         )
     }
 

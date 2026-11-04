@@ -84,7 +84,7 @@ class TvhSession(
         )
     }
 
-    private val prewarmer = if (useHtsp) NeighbourPrewarmer(context, client, ::connectHtsp) else null
+    private val prewarmer = if (useHtsp && client.config.prewarm) NeighbourPrewarmer(context, client, ::connectHtsp) else null
 
     private val audioOutput = AudioOutput(context)
     private val trackMenu = TrackMenu(context, audioOutput)
