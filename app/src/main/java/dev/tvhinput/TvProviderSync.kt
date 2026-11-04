@@ -116,9 +116,9 @@ class TvProviderSync(private val context: Context, private val client: TvhClient
     }
 
     /**
-     * Radio channels, from HTSP's channel info (the HTTP API only exposes service types to
-     * admins) plus the ones playback found to have no video. HTSP is optional: without it the
-     * channels detected at playback are kept.
+     * Radio channels. tvheadend is the authority: when HTSP is reachable, its service types (the
+     * HTTP API only exposes them to admins) replace the saved set, including channels playback
+     * marked as radio. HTSP is optional: without it the channels detected at playback are kept.
      */
     private fun detectRadioChannels(channels: List<TvhChannel>): Set<String> {
         val fromHtsp = try {

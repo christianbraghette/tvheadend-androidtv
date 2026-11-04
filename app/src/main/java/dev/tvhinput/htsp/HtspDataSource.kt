@@ -71,7 +71,14 @@ class HtspDataSource(
         var current = chunk
         while (current == null) {
             if (Thread.interrupted()) throw InterruptedIOException()
-            when (val item = queue.poll(100, TimeUnit.MILLISECONDS)) {
+            // Media3 cancels a load by interrupting this thread and expects an IOException back.
+            val item = try {
+                queue.poll(100, TimeUnit.MILLISECONDS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw InterruptedIOException()
+            }
+            when (item) {
                 null -> {
                     // tvheadend sends status messages every second while subscribed: total silence
                     // means a dead connection or stream, so fail and let the player resubscribe.

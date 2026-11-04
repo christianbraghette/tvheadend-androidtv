@@ -261,7 +261,8 @@ class TvhSession(
 
     /**
      * Playback found no video stream at all: it's a radio channel. Remember it and tell TV apps,
-     * which can then show it as audio-only (and the next sync keeps it that way).
+     * which can then show it as audio-only. A sync with HTSP replaces this with tvheadend's own
+     * service types; without HTSP the next sync keeps it.
      */
     private fun markRadio(uuid: String, channelUri: Uri) {
         if (uuid in RadioChannels.load(context)) return
