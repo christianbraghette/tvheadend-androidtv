@@ -42,7 +42,7 @@ class HtspExtractor(
         } else null
         /** "MPEG4AUDIO" whose packets turned out to be LATM, not ADTS (see onPacket). */
         var latm: LatmAudio? = null
-        val aspect = if (video) VideoAspectReader(codec, name) else null
+        var aspect = if (video) VideoAspectReader(codec, name) else null
         val text = if (codec == "TEXTSUB") TextSubtitles() else null
 
         // A video picture whose data is written but not yet committed, in case the next packet
@@ -70,10 +70,16 @@ class HtspExtractor(
     }
 
     private lateinit var extractorOutput: ExtractorOutput
-    private val tracks = HashMap<Int, Track>()
+    private var tracks = HashMap<Int, Track>()
+    /** The current stream numbers in subscriptionStart order, to map a restart's new numbers onto [tracks]. */
+    private var streamOrder = emptyList<Int>()
     private var started = false
     private var baseTimeUs = C.TIME_UNSET
     private var firstPacketUs = C.TIME_UNSET
+    /** Latest sample time handed to the player, to continue from after a restart. */
+    private var lastOutputUs = 0L
+    /** tvheadend restarted the stream; its timeline may restart too (checked on the next packet). */
+    private var restarted = false
     private val header = ByteArray(4)
     private var body = ByteArray(64 * 1024)
     private val fields = HtsFieldReader()
@@ -132,8 +138,11 @@ class HtspExtractor(
     }
 
     private fun onStart(msg: HtsMsg) {
-        // Tracks can't change once declared; tvheadend sends a new start only on stream changes.
-        if (started) return
+        // Tracks can't change once declared; HtspDataSource passes on only restarts with the same streams.
+        if (started) {
+            onRestart(msg)
+            return
+        }
         for (stream in msg.list("streams")) {
             stream as HtsMsg
             Log.d(TAG, "From tvheadend: $stream")
@@ -151,9 +160,60 @@ class HtspExtractor(
             val video = if (track.video) " ${format.width}x${format.height} par=${format.pixelWidthHeightRatio}" else ""
             Log.i(TAG, "Stream $index: $codec ${format.sampleMimeType} ${format.language ?: ""}$video")
         }
+        streamOrder = msg.list("streams").map { (it as? HtsMsg)?.int("index") ?: -1 }
         extractorOutput.endTracks()
         extractorOutput.seekMap(SeekMap.Unseekable(C.TIME_UNSET))
         started = true
+    }
+
+    /**
+     * tvheadend restarted the subscription with the same streams (subscriptionStop, then this). It
+     * does that when a video's picture size changes, e.g. Rai 3 switching between 1080i national and
+     * 720p regional programmes. Video starts over as at tune-in: wait for a keyframe and give the
+     * new decoder that keyframe's SPS/PPS and the new size. Audio carries on as it is.
+     */
+    private fun onRestart(msg: HtsMsg) {
+        // HtspDataSource passes on only a restart with the same streams in the same order, but maybe
+        // new numbers (Rai 3's regional and national programmes): the n-th stream keeps the n-th track.
+        val streams = msg.list("streams")
+        if (streams.size != streamOrder.size) {
+            Log.w(TAG, "Restart with ${streams.size} streams instead of ${streamOrder.size}: ignored")
+            return
+        }
+        val remapped = HashMap<Int, Track>()
+        val newOrder = streams.map { (it as? HtsMsg)?.int("index") ?: -1 }
+        for ((i, newIndex) in newOrder.withIndex()) tracks[streamOrder[i]]?.let { remapped[newIndex] = it }
+        if (newOrder != streamOrder) Log.i(TAG, "Restart renumbered the streams: $streamOrder -> $newOrder")
+        tracks = remapped
+        streamOrder = newOrder
+        for (stream in streams) {
+            stream as HtsMsg
+            val index = stream.int("index") ?: continue
+            val track = tracks[index] ?: continue
+            if (!track.video) continue
+            Log.i(TAG, "Restart from tvheadend: $stream")
+            commitPending(track)
+            val fresh = formatFor(track.format.id?.toIntOrNull() ?: index, track.codec, stream) ?: continue
+            val format = track.format.buildUpon()
+                .setWidth(fresh.width).setHeight(fresh.height)
+                .setPixelWidthHeightRatio(fresh.pixelWidthHeightRatio)
+                .setFrameRate(fresh.frameRate)
+                .build()
+            track.aspect = VideoAspectReader(track.codec, track.name)
+            track.firstKeyFrameUs = C.TIME_UNSET
+            if (track.codec == "H264") {
+                // Declared at the next keyframe with its SPS/PPS, as at the start.
+                track.format = format.buildUpon().setInitializationData(emptyList()).build()
+                track.sps = null
+                track.pps = null
+                track.formatPending = true
+            } else {
+                track.update(format)
+            }
+            Log.i(TAG, "Stream $index restarted: ${format.width}x${format.height} par=${format.pixelWidthHeightRatio}")
+        }
+        firstPacketUs = C.TIME_UNSET
+        restarted = true
     }
 
     /** One muxpkt; its payload is `body[offset, offset + size)`. Times are in µs. */
@@ -166,6 +226,14 @@ class HtspExtractor(
         // the "leading" B-frames that follow it but show before it: they reference the previous
         // GOP, which this subscription never received.
         if (firstPacketUs == C.TIME_UNSET) firstPacketUs = timestamp
+        if (restarted) {
+            restarted = false
+            // tvheadend may restart its timeline with the stream: keep the player's going.
+            if (baseTimeUs != C.TIME_UNSET && abs(timestamp - baseTimeUs - lastOutputUs) > MAX_RESTART_JUMP_US) {
+                Log.i(TAG, "Timeline jumped by ${(timestamp - baseTimeUs - lastOutputUs) / 1000} ms on restart: continuing from the last sample")
+                baseTimeUs = timestamp - lastOutputUs - RESTART_STEP_US
+            }
+        }
         if (timestamp - firstPacketUs > FORMAT_WAIT_US) declarePendingFormats() // no keyframe: don't block audio
         if (track.formatPending) collectParameterSets(track, offset, size)
         if (track.video) {
@@ -253,6 +321,7 @@ class HtspExtractor(
     }
 
     private fun commitSample(track: Track, timeUs: Long, flags: Int, size: Int) {
+        if (timeUs > lastOutputUs) lastOutputUs = timeUs
         track.output.sampleMetadata(timeUs, flags, size, 0, null)
     }
 
@@ -410,6 +479,9 @@ class HtspExtractor(
         const val NONE = Long.MIN_VALUE
         const val FORMAT_WAIT_US = 3_000_000L
         const val FIELD_TOLERANCE_US = 2L // 90 kHz -> µs rounding
+        /** A restarted stream's time this far from the last sample means tvheadend restarted its timeline. */
+        const val MAX_RESTART_JUMP_US = 10_000_000L
+        const val RESTART_STEP_US = 40_000L
         const val NAL_SPS = 7
         const val NAL_PPS = 8
         val METHOD = HtsFieldReader.name("method")
@@ -423,3 +495,6 @@ class HtspExtractor(
         fun isVideo(codec: String) = codec == "H264" || codec == "HEVC" || codec == "MPEG2VIDEO"
     }
 }
+
+/** What makes a subscriptionStart stream the same stream after a restart: its type and language, not its number. */
+internal fun streamKey(stream: HtsMsg?): String = stream?.let { "${it.str("type")}:${it.str("language") ?: ""}" } ?: ""

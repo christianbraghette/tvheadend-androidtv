@@ -38,6 +38,9 @@ class HtspDataSource(
     private object EndOfStream
 
     @Volatile private var streamsSignature: List<String>? = null
+    /** When tvheadend sent subscriptionStop (0 = running), and why; cleared by its next subscriptionStart. */
+    @Volatile private var stoppedAtNs = 0L
+    @Volatile private var stopReason: String? = null
 
     private val queue = LinkedBlockingQueue<Any>()
     /** Set on the loading thread, also read on the connection's reader thread (onMessage). */
@@ -130,6 +133,8 @@ class HtspDataSource(
             ?: throw IOException("Invalid HTSP uri ${dataSpec.uri}")
         queue.clear()
         streamsSignature = null
+        stoppedAtNs = 0L
+        stopReason = null
         receivedPacket = false
         lastMessageCount = 0
         probedFor = 0
@@ -157,6 +162,12 @@ class HtspDataSource(
             }
             when (item) {
                 null -> {
+                    val stoppedAt = stoppedAtNs
+                    if (stoppedAt != 0L && System.nanoTime() - stoppedAt > RESTART_WAIT_NS) {
+                        val reason = stopReason ?: "unknown"
+                        onStatus(reason)
+                        throw IOException("Subscription stopped: $reason")
+                    }
                     probeIfStalled()
                     // tvheadend sends status messages every second while subscribed: total silence
                     // means a dead connection or stream, so fail and let the player resubscribe.
@@ -265,23 +276,34 @@ class HtspDataSource(
             "signalStatus" -> health.onSignal(msg!!)
             "queueStatus" -> health.onQueue(msg!!)
             "subscriptionStart" -> {
-                val signature = msg!!.list("streams").map { (it as? HtsMsg)?.let { s -> "${s.int("index")}:${s.str("type")}" } ?: "" }
+                // Not the stream numbers: Rai 3's regional and national programmes are the same
+                // streams under new numbers, which HtspExtractor maps onto the tracks it has.
+                val signature = msg!!.list("streams").map { streamKey(it as? HtsMsg) }
                 val previous = streamsSignature
-                when {
-                    previous == null -> {
+                if (stoppedAtNs != 0L) Log.i(TAG, "tvheadend restarted the stream after ${(now - stoppedAtNs) / 1_000_000} ms")
+                stoppedAtNs = 0L
+                stopReason = null
+                when (previous) {
+                    // First start, or a restart with the same streams (e.g. a new picture size):
+                    // HtspExtractor carries on with the new parameters.
+                    null, signature -> {
                         streamsSignature = signature
                         queue.put(Chunk(body, length))
                         return // the queue owns the buffer now
                     }
                     // Tracks can't be added to a prepared player: end the stream so the session
                     // restarts the channel with the new set of streams.
-                    previous != signature -> queue.put(EndOfStream)
+                    else -> queue.put(EndOfStream)
                 }
             }
             "subscriptionStatus" -> onStatus(msg!!.str("subscriptionError"))
             "subscriptionStop" -> {
-                msg!!.str("subscriptionError")?.let(onStatus)
-                queue.put(IOException("Subscription stopped: ${msg.str("subscriptionError") ?: msg.str("status") ?: "unknown"}"))
+                // tvheadend also stops a subscription to restart it, e.g. when the picture size
+                // changes (Rai 3: 1080i national <-> 720p regional), and a new subscriptionStart
+                // follows on the same subscription. So it only fails if no start comes (see read).
+                stopReason = msg!!.str("subscriptionError") ?: msg.str("status") ?: "unknown"
+                stoppedAtNs = now
+                Log.i(TAG, "tvheadend stopped the stream ($stopReason): waiting for it to restart")
             }
         }
         BufferPool.recycle(body)
@@ -298,6 +320,8 @@ class HtspDataSource(
         const val ARRIVAL_GAP_NS = 700_000_000L
         const val SUMMARY_INTERVAL_NS = 30_000_000_000L
         const val PROBE_TIMEOUT_MS = 5_000L
+        /** tvheadend holds a restarted stream up to 5 s while it waits for the new codec headers. */
+        const val RESTART_WAIT_NS = 8_000_000_000L
         val STATUS_METHODS = setOf("signalStatus", "queueStatus")
     }
 }
