@@ -1,11 +1,13 @@
 package tv.mochimochi.tvhinput
 
 import android.util.Log
+import tv.mochimochi.tvhinput.htsp.BufferPool
 import tv.mochimochi.tvhinput.htsp.HtsMsg
 import tv.mochimochi.tvhinput.htsp.HtspConnection
 import java.io.IOException
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 
@@ -23,7 +25,9 @@ class GuideSnapshot(
  * connection stays open. Deletions are only ever sent live, so each new connection starts with a
  * full comparison ([Listener.onSnapshot]).
  *
- * All [Listener] calls come from the connection's reader thread, in the server's order.
+ * The connection's reader thread may also be delivering a channel's stream, so it only copies the
+ * messages: they are decoded on a background thread, which makes all [Listener] calls, in the
+ * server's order.
  */
 class HtspGuide(private val client: TvhClient, private val listener: Listener) : HtspConnection.MetadataListener {
 
@@ -41,31 +45,40 @@ class HtspGuide(private val client: TvhClient, private val listener: Listener) :
     private val channels = HashMap<Int, Channel>() // HTSP channel id -> channel
     /** Numbers given to channels without one in the initial dump, kept for their live updates. */
     private val fallbackNumbers = HashMap<String, String>()
+    // All state below belongs to the DECODER thread.
     private val initialEvents = ArrayList<TvhEvent>()
-    @Volatile private var initialDone = false
-    private var readerLowered = false // reader thread only
+    private var initialDone = false
     /** Uuids by HTSP id from the HTTP API, for servers whose HTSP doesn't send channelIdStr. */
     private var httpUuids: Map<Int, String>? = null
 
-    /** Connects and asks for the metadata; the caller closes the returned connection to stop. */
-    fun start(): HtspConnection {
-        val connection = HtspConnection.connect(client.config)
-        try {
-            connection.metadataListener = this
-            connection.request(HtsMsg.of("method" to "enableAsyncMetadata", "epg" to 1))
-        } catch (e: IOException) {
-            connection.close()
-            throw e
-        }
-        return connection
+    /**
+     * Asks [connection], a fresh one, for the metadata. It stays this guide's until it closes;
+     * [Listener.onConnectionLost] tells when that happens.
+     */
+    fun attach(connection: HtspConnection) {
+        connection.metadataListener = this
+        connection.request(HtsMsg.of("method" to "enableAsyncMetadata", "epg" to 1))
     }
 
-    override fun onMetadata(method: String, msg: HtsMsg) {
-        // This connection's reader decodes the whole guide: keep it out of playback's way.
-        if (!readerLowered) {
-            readerLowered = true
-            lowerCurrentThreadPriority()
+    override fun onMetadata(method: String, body: ByteArray, length: Int) {
+        // A copy of the exact size: pooled buffers are larger, and a whole guide may be queued here.
+        val copy = body.copyOf(length)
+        BufferPool.recycle(body)
+        post { handle(method, HtsMsg.deserialize(copy, 0, copy.size)) }
+    }
+
+    // After the metadata already queued, so a listener sees everything that arrived first.
+    override fun onConnectionLost(error: IOException) = post { listener.onConnectionLost(error) }
+
+    private fun post(block: () -> Unit) = DECODER.execute {
+        try {
+            block()
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Couldn't process guide data", e)
         }
+    }
+
+    private fun handle(method: String, msg: HtsMsg) {
         when (method) {
             "channelAdd", "channelUpdate" -> {
                 val id = msg.int("channelId") ?: return
@@ -98,8 +111,6 @@ class HtspGuide(private val client: TvhClient, private val listener: Listener) :
             }
         }
     }
-
-    override fun onConnectionLost(error: IOException) = listener.onConnectionLost(error)
 
     private fun snapshot(): GuideSnapshot {
         val sorted = channels.values.sortedWith(compareBy({ it.major }, { it.minor }, { it.name }))
@@ -184,7 +195,16 @@ class HtspGuide(private val client: TvhClient, private val listener: Listener) :
         private const val SERVICE_CONTENT_RADIO = 2
         private const val DUMP_TIMEOUT_S = 180L
 
-        /** One full dump over HTSP, without staying connected. */
+        /**
+         * Decodes every guide's messages, in arrival order, at background priority: on a busy
+         * Chromecast decoding a whole guide at normal priority starves playback.
+         */
+        private val DECODER = Executors.newSingleThreadExecutor(backgroundThreads("tvh-guide-decode"))
+
+        /**
+         * One full dump over a connection of its own, closed afterwards: for syncs while the TV
+         * input isn't running (setup, the periodic worker), when there is no shared connection.
+         */
         fun fetch(client: TvhClient): GuideSnapshot {
             val result = CompletableFuture<GuideSnapshot>()
             val guide = HtspGuide(client, object : Listener {
@@ -195,7 +215,8 @@ class HtspGuide(private val client: TvhClient, private val listener: Listener) :
                 override fun onEventDeleted(eventId: Long) {}
                 override fun onConnectionLost(error: IOException) { result.completeExceptionally(error) }
             })
-            guide.start().use {
+            HtspConnection.connect(client.config).use { connection ->
+                guide.attach(connection)
                 return try {
                     result.get(DUMP_TIMEOUT_S, TimeUnit.SECONDS)
                 } catch (e: TimeoutException) {

@@ -54,12 +54,13 @@ class HtspDataSource(
     private var chunk: Chunk? = null
     /** Read position in [chunk]: -4..-1 while emitting its length header, then the body offset. */
     private var chunkPos = 0
-    // Stall detection. lastMessageNs and receivedPacket are written by the reader thread and read by
-    // the loading thread; lastMessageCount and health belong to the reader thread, probedFor to the
+    // Stall detection. lastMessageNs, lastMessageCount and receivedPacket are written by the reader
+    // thread and read by the loading thread; health belongs to the reader thread, probedFor to the
     // loading thread. open() resets them before subscribing.
     @Volatile private var lastMessageNs = 0L
     @Volatile private var receivedPacket = false
-    private var lastMessageCount = 0L
+    /** The connection's [HtspConnection.messagesReceived] at this stream's last message. */
+    @Volatile private var lastMessageCount = 0L
     /** [lastMessageNs] of the stall last probed, so each stall is probed once. */
     private var probedFor = 0L
     @Volatile private var health = StreamHealth("")
@@ -173,8 +174,11 @@ class HtspDataSource(
                     // means a dead connection or stream, so fail and let the player resubscribe.
                     if (System.nanoTime() - lastMessageNs > NO_DATA_TIMEOUT_NS) {
                         val reason = "No data from tvheadend for ${NO_DATA_TIMEOUT_NS / 1_000_000_000} s"
-                        // Don't reuse a connection that may be dead: the retry opens a fresh one.
-                        connection?.abort(reason)
+                        // The connection is shared (guide, other sessions): only drop it if nothing
+                        // else arrived on it either, so the retry opens a fresh one. Otherwise just
+                        // this subscription is stuck and the retry subscribes again.
+                        val c = connection
+                        if (c != null && c.messagesReceived == lastMessageCount) c.abort(reason)
                         throw IOException(reason)
                     }
                     continue

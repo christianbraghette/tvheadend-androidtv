@@ -5,7 +5,6 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.lifecycle.lifecycleScope
-import tv.mochimochi.tvhinput.htsp.HtspConnection
 import tv.mochimochi.tvhinput.ui.SetupScreen
 import tv.mochimochi.tvhinput.ui.SetupState
 import tv.mochimochi.tvhinput.ui.SetupStatus
@@ -69,16 +68,18 @@ class SetupActivity : ComponentActivity() {
             try {
                 val client = TvhClient(config)
                 val info = withContext(Dispatchers.IO) { client.serverInfo() }
-                if (config.protocol == StreamProtocol.HTSP) {
+                val sync = TvProviderSync(applicationContext, client)
+                val snapshot = if (config.protocol == StreamProtocol.HTSP) {
                     showStatus(getString(R.string.setup_checking_htsp))
-                    // Fail here, not at the first tune, if HTSP is unreachable or not allowed.
-                    withContext(Dispatchers.IO) { HtspConnection.connect(config).close() }
+                    // No HTTP fallback: fail here, not at the first tune, if HTSP is unreachable or
+                    // not allowed. The same connection brings the channels and guide.
+                    withContext(Dispatchers.IO) { HtspGuide.fetch(client) }
+                } else {
+                    withContext(Dispatchers.IO) { sync.fetch() }
                 }
                 Settings.save(this@SetupActivity, config)
 
                 showStatus(getString(R.string.setup_importing, info.name, info.version, config.protocol.name))
-                val sync = TvProviderSync(applicationContext, client)
-                val snapshot = withContext(Dispatchers.IO) { sync.fetch() }
                 val channels = withContext(Dispatchers.IO) { sync.syncChannels(snapshot) }
 
                 showStatus(getString(R.string.setup_loading_guide, channels.size))

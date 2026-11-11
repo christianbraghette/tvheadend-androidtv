@@ -59,15 +59,14 @@ import java.io.IOException
 class TvhSession(
     private val context: Context,
     private val client: TvhClient,
+    /** The TV input's shared HTSP connection ([HtspHub.connection]): a zap is just unsubscribe + subscribe. */
+    private val htsp: () -> HtspConnection,
 ) : TvInputService.Session(context), Player.Listener {
 
     private val handler = Handler(Looper.getMainLooper())
 
     private val useHtsp = client.config.protocol == StreamProtocol.HTSP
 
-    // One HTSP connection per session, reused across tunes so a zap is just unsubscribe + subscribe.
-    private val htspLock = Any()
-    @Volatile private var htspConnection: HtspConnection? = null
     @Volatile private var released = false
 
     private val mediaSourceFactory = if (useHtsp) {
@@ -270,13 +269,9 @@ class TvhSession(
     }
 
     /** Called on the loader thread when an HTSP subscription starts. */
-    private fun connectHtsp(): HtspConnection = synchronized(htspLock) {
+    private fun connectHtsp(): HtspConnection {
         if (released) throw IOException("Session released")
-        htspConnection?.takeIf { !it.isClosed }?.let { return it }
-        HtspConnection.connect(client.config).also {
-            htspConnection = it
-            if (released) it.close()
-        }
+        return htsp()
     }
 
     private fun play(uuid: String) {
@@ -452,10 +447,10 @@ class TvhSession(
         handler.removeCallbacksAndMessages(null)
         context.unregisterReceiver(ratingSettingsReceiver)
         player.removeListener(this)
-        player.release()
-        prewarmer?.release() // closing the connection below also ends its subscriptions
         released = true
-        htspConnection?.close()
+        // Ends this session's subscriptions; the connection is shared and stays open.
+        player.release()
+        prewarmer?.release()
     }
 
     // Player.Listener

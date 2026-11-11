@@ -24,6 +24,11 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
 
     private fun sync(): Result {
         val config = Settings.load(applicationContext) ?: return Result.success()
+        if (GuideMonitor.isLive) {
+            // The running TV input follows every change on its connection: a sync would only open a second one.
+            Log.i(TAG, "Guide followed live over HTSP: nothing to sync")
+            return Result.success()
+        }
         try {
             val programs = TvProviderSync(applicationContext, TvhClient(config)).syncAll()
             Log.i(TAG, "Sync finished, $programs programs")

@@ -1,11 +1,13 @@
 package tv.mochimochi.tvhinput
 
 import android.content.Context
+import android.content.SharedPreferences
 import androidx.core.content.edit
+import java.io.Closeable
 
 /**
  * How live streams are fetched. Independent of how channels and the guide are synced: over HTSP
- * whenever the server allows it, the HTTP API otherwise (see TvProviderSync).
+ * whenever the server allows it, the HTTP API otherwise (see HtspHub and TvProviderSync).
  */
 enum class StreamProtocol { HTTP, HTSP }
 
@@ -50,6 +52,18 @@ object Settings {
             htspPort = p.getInt("htsp_port", 9982),
             prewarm = p.getBoolean("prewarm", false),
         )
+    }
+
+    /**
+     * Calls [onChange] (on the main thread) whenever the settings are written, once per changed
+     * key. Close the result to stop. The listener is held strongly here: SharedPreferences only
+     * keeps a weak reference.
+     */
+    fun observe(context: Context, onChange: () -> Unit): Closeable {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> onChange() }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        return Closeable { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
     }
 
     fun save(context: Context, config: TvhConfig) {

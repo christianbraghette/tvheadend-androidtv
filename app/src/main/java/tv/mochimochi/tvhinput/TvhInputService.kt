@@ -8,23 +8,25 @@ import android.media.tv.TvInputService
 /** The system-facing TV input: Live Channels and other TIF apps bind to this to tune tvheadend channels. */
 class TvhInputService : TvInputService() {
 
-    // TV apps bind this service while they use it: keep their guide current meanwhile.
-    private var guideMonitor: GuideMonitor? = null
+    // TV apps bind this service while they use it: one HTSP connection meanwhile, for the guide
+    // and for every session's streams.
+    private var hub: HtspHub? = null
 
     override fun onCreate() {
         super.onCreate()
-        guideMonitor = GuideMonitor(this).also { it.start() }
+        hub = HtspHub(this).also { it.start() }
     }
 
     override fun onDestroy() {
-        guideMonitor?.stop()
-        guideMonitor = null
+        hub?.close()
+        hub = null
         super.onDestroy()
     }
 
     override fun onCreateSession(inputId: String): Session? {
         val config = Settings.load(this) ?: return null
-        return TvhSession(this, TvhClient(config))
+        val hub = hub ?: return null
+        return TvhSession(this, TvhClient(config), hub::connection)
     }
 
     companion object {

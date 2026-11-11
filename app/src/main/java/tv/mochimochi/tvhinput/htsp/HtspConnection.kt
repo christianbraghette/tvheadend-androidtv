@@ -40,8 +40,12 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
 
     /** Receives the asynchronous metadata (channelAdd, eventUpdate, ...) of `enableAsyncMetadata`. */
     interface MetadataListener {
-        /** Called on the reader thread, in the order the server sent the messages. */
-        fun onMetadata(method: String, msg: HtsMsg)
+        /**
+         * Called on the reader thread, in the order the server sent the messages, with the encoded
+         * body like [SubscriptionListener.onMessage] (the listener owns [body]). The same thread
+         * delivers the stream packets: hand the decoding off, don't do it here.
+         */
+        fun onMetadata(method: String, body: ByteArray, length: Int)
 
         fun onConnectionLost(error: IOException)
     }
@@ -57,8 +61,14 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
     private val subscriptions = ConcurrentHashMap<Int, SubscriptionListener>()
 
     private val closed = AtomicBoolean()
+    private val closedSignal = CompletableFuture<Unit>()
 
     val isClosed: Boolean get() = closed.get()
+
+    /** Runs [action] once the connection is closed, for whatever reason (at once if it already is). */
+    fun whenClosed(action: () -> Unit) {
+        closedSignal.thenRun(action)
+    }
 
     /** When the last message arrived: a connection that went silent is checked with a ping. */
     @Volatile private var lastReceivedNs = System.nanoTime()
@@ -200,8 +210,7 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
                 if (subscriptionId == NONE && method != null) {
                     val metadata = metadataListener
                     if (metadata != null) {
-                        metadata.onMetadata(method, HtsMsg.deserialize(body, 0, length))
-                        BufferPool.recycle(body)
+                        metadata.onMetadata(method, body, length)
                         continue
                     }
                 }
@@ -237,6 +246,7 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
             socket.close()
         } catch (_: IOException) {
         }
+        closedSignal.complete(Unit)
         return true
     }
 
