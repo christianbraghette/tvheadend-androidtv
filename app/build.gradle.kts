@@ -6,11 +6,11 @@ plugins {
 }
 
 android {
-    namespace = "dev.tvhinput"
+    namespace = "tv.mochimochi.tvhinput"
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "dev.tvhinput"
+        applicationId = "tv.mochimochi.tvhinput"
         minSdk = 26
         targetSdk = 35
         versionCode = 1
