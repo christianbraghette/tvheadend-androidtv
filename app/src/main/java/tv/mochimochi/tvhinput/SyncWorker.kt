@@ -24,10 +24,23 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
 
     private fun sync(): Result {
         val config = Settings.load(applicationContext) ?: return Result.success()
-        if (GuideMonitor.isLive) {
-            // The running TV input follows every change on its connection: a sync would only open a second one.
-            Log.i(TAG, "Guide followed live over HTSP: nothing to sync")
-            return Result.success()
+        val live = GuideMonitor.active?.takeIf { GuideMonitor.isLive }
+        if (live != null) {
+            // The running TV input follows every change on its connection: resync on that one
+            // instead of opening a second, which also fills in any change that failed to be written.
+            val done = try {
+                live.resync().get(RESYNC_TIMEOUT_MIN, TimeUnit.MINUTES)
+            } catch (e: Exception) {
+                Log.w(TAG, "Live guide resync didn't finish: ${e.message}")
+                false
+            }
+            if (done) {
+                Log.i(TAG, "Guide resynced on the TV input's connection")
+                return Result.success()
+            }
+            // It may have just dropped: the reconnect resyncs everything anyway, so only retry
+            // if nothing follows the guide any more.
+            if (GuideMonitor.isLive) return Result.success()
         }
         try {
             val programs = TvProviderSync(applicationContext, TvhClient(config)).syncAll()
@@ -45,6 +58,7 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
     companion object {
         private const val TAG = "SyncWorker"
         private const val WORK_NAME = "tvh-epg-sync"
+        private const val RESYNC_TIMEOUT_MIN = 10L
 
         fun schedule(context: Context) {
             val request = PeriodicWorkRequestBuilder<SyncWorker>(6, TimeUnit.HOURS)

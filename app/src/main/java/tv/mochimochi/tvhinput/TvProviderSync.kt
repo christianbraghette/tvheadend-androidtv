@@ -58,9 +58,10 @@ class TvProviderSync(private val context: Context, private val client: TvhClient
     /**
      * Updates the program guide of every channel in place, matching programs by tvheadend event id,
      * so TV apps never see an empty guide while a sync runs. Programs whose content is unchanged
-     * are left alone. Returns the number of programs.
+     * are left alone. Programs that ended before [keepEndedBefore] are kept even when [events]
+     * doesn't have them. Returns the number of programs.
      */
-    fun syncPrograms(events: List<TvhEvent>, channelIds: Map<String, Long>): Int = synchronized(WRITE_LOCK) {
+    fun syncPrograms(events: List<TvhEvent>, channelIds: Map<String, Long>, keepEndedBefore: Long? = null): Int = synchronized(WRITE_LOCK) {
         val byChannel = events.groupBy { it.channelUuid }
         var count = 0
         var written = 0
@@ -77,7 +78,10 @@ class TvProviderSync(private val context: Context, private val client: TvhClient
                         ops += ContentProviderOperation.newUpdate(TvContract.buildProgramUri(row.id)).withValues(values).build()
                 }
             }
-            existing.values.forEach { ops += ContentProviderOperation.newDelete(TvContract.buildProgramUri(it.id)).build() }
+            for (row in existing.values) {
+                if (keepEndedBefore != null && row.endMs < keepEndedBefore) continue
+                ops += ContentProviderOperation.newDelete(TvContract.buildProgramUri(row.id)).build()
+            }
             ops.chunked(BATCH_SIZE).forEach { resolver.applyBatch(TvContract.AUTHORITY, ArrayList(it)) }
             count += channelEvents.size
             written += ops.size
@@ -111,22 +115,22 @@ class TvProviderSync(private val context: Context, private val client: TvhClient
         return map
     }
 
-    /** A program row: its id and the [fingerprintOf] the values it was last written with. */
-    class ProgramRow(val id: Long, val fingerprint: String)
+    /** A program row: its id, the [fingerprintOf] the values it was last written with, and its end time. */
+    class ProgramRow(val id: Long, val fingerprint: String, val endMs: Long)
 
     /** tvheadend event id -> program row; programs without a usable event id are dropped. */
     fun existingPrograms(channelId: Long): HashMap<Long, ProgramRow> {
         val map = HashMap<Long, ProgramRow>()
         resolver.query(
             TvContract.buildProgramsUriForChannel(channelId),
-            arrayOf(TvContract.Programs._ID, TvContract.Programs.COLUMN_INTERNAL_PROVIDER_DATA),
+            arrayOf(TvContract.Programs._ID, TvContract.Programs.COLUMN_INTERNAL_PROVIDER_DATA, TvContract.Programs.COLUMN_END_TIME_UTC_MILLIS),
             null, null, null,
         )?.use { c ->
             while (c.moveToNext()) {
                 // "eventId:fingerprint"; rows written by older versions hold just the event id.
                 val data = c.getBlob(1)?.let { String(it) }
                 val eventId = data?.substringBefore(':')?.toLongOrNull()
-                if (eventId != null && eventId !in map) map[eventId] = ProgramRow(c.getLong(0), data.substringAfter(':', ""))
+                if (eventId != null && eventId !in map) map[eventId] = ProgramRow(c.getLong(0), data.substringAfter(':', ""), c.getLong(2))
                 else resolver.delete(TvContract.buildProgramUri(c.getLong(0)), null, null)
             }
         }

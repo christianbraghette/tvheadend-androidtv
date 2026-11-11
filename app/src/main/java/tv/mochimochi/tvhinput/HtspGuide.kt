@@ -8,6 +8,7 @@ import java.io.IOException
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 
@@ -17,6 +18,11 @@ class GuideSnapshot(
     /** Uuids of the radio channels, or null when the source can't tell (then the ones found at playback are kept). */
     val radio: Set<String>?,
     val events: List<TvhEvent>,
+    /**
+     * Set when [events] leaves out what already ended (a resync gets programmes from the one on
+     * air onwards): stored programmes that ended before this time are kept, not deleted.
+     */
+    val keepEndedBefore: Long? = null,
 )
 
 /**
@@ -50,14 +56,81 @@ class HtspGuide(private val client: TvhClient, private val listener: Listener) :
     private var initialDone = false
     /** Uuids by HTSP id from the HTTP API, for servers whose HTSP doesn't send channelIdStr. */
     private var httpUuids: Map<Int, String>? = null
+    @Volatile private var connection: HtspConnection? = null
 
     /**
      * Asks [connection], a fresh one, for the metadata. It stays this guide's until it closes;
      * [Listener.onConnectionLost] tells when that happens.
      */
     fun attach(connection: HtspConnection) {
+        this.connection = connection
         connection.metadataListener = this
         connection.request(HtsMsg.of("method" to "enableAsyncMetadata", "epg" to 1))
+    }
+
+    /**
+     * Fetches the whole guide again on the same connection and passes it to [Listener.onSnapshot],
+     * which puts right whatever a live change failed to write. Channel by channel (`getEvents`),
+     * so no reply is huge. The live changes that arrive meanwhile wait and are applied after it,
+     * in order. Completes with false if it couldn't be done (the stored guide is then untouched).
+     *
+     * `getEvents` needs HTSP streaming rights, which the live guide doesn't: without them the
+     * events come from the HTTP API instead.
+     */
+    fun resync(): CompletableFuture<Boolean> {
+        val done = CompletableFuture<Boolean>()
+        try {
+            post {
+                try {
+                    done.complete(doResync())
+                } catch (e: IOException) {
+                    Log.w(TAG, "Guide resync failed: ${e.message}")
+                    done.complete(false)
+                } finally {
+                    done.complete(false) // a RuntimeException, logged by post
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            done.complete(false)
+        }
+        return done
+    }
+
+    private fun doResync(): Boolean {
+        // Before the initial snapshot there's nothing to resync: that snapshot is on its way.
+        if (!initialDone) return false
+        val c = connection?.takeIf { !it.isClosed } ?: return false
+        val since = System.currentTimeMillis()
+        val events = try {
+            eventsOverHtsp(c)
+        } catch (e: HtspRefusedException) {
+            if (c.isClosed) throw e
+            Log.i(TAG, "No guide over getEvents (${e.message}): using the HTTP API")
+            client.events()
+        }
+        val snapshot = snapshot(events, keepEndedBefore = since)
+        Log.i(TAG, "Resync: ${snapshot.channels.size} channels, ${snapshot.events.size} events from now on")
+        listener.onSnapshot(snapshot)
+        return true
+    }
+
+    private class HtspRefusedException(message: String) : IOException(message)
+
+    private fun eventsOverHtsp(c: HtspConnection): List<TvhEvent> {
+        val events = ArrayList<TvhEvent>()
+        for (id in channels.keys.toList()) {
+            val reply = try {
+                c.request(HtsMsg.of("method" to "getEvents", "channelId" to id), GET_EVENTS_TIMEOUT_MS)
+            } catch (e: IOException) {
+                // tvheadend's error replies (no rights, channel gone) leave the connection open.
+                if (!c.isClosed) throw HtspRefusedException(e.message.orEmpty())
+                throw e
+            }
+            // Always present in a successful reply, empty for a channel without guide.
+            val list = reply["events"] as? List<*> ?: throw IOException("getEvents reply without events")
+            list.mapNotNullTo(events) { (it as? HtsMsg)?.let(::parseEvent) }
+        }
+        return events
     }
 
     override fun onMetadata(method: String, body: ByteArray, length: Int) {
@@ -99,7 +172,7 @@ class HtspGuide(private val client: TvhClient, private val listener: Listener) :
             "eventDelete" -> if (initialDone) msg.long("eventId")?.let(listener::onEventDeleted)
             "initialSyncCompleted" -> {
                 initialDone = true
-                val snapshot = snapshot()
+                val snapshot = snapshot(ArrayList(initialEvents))
                 initialEvents.clear()
                 initialEvents.trimToSize()
                 Log.i(
@@ -112,7 +185,7 @@ class HtspGuide(private val client: TvhClient, private val listener: Listener) :
         }
     }
 
-    private fun snapshot(): GuideSnapshot {
+    private fun snapshot(events: List<TvhEvent>, keepEndedBefore: Long? = null): GuideSnapshot {
         val sorted = channels.values.sortedWith(compareBy({ it.major }, { it.minor }, { it.name }))
         val list = sorted.mapIndexed { index, c ->
             // Like the HTTP API sync: channels without a number are numbered by position.
@@ -121,7 +194,7 @@ class HtspGuide(private val client: TvhClient, private val listener: Listener) :
             toTvhChannel(c, fallback)
         }
         val radio = channels.values.filter { it.radio }.mapTo(HashSet()) { it.uuid }
-        return GuideSnapshot(list, radio, ArrayList(initialEvents))
+        return GuideSnapshot(list, radio, events, keepEndedBefore)
     }
 
     private fun toTvhChannel(c: Channel, fallbackNumber: String) = TvhChannel(
@@ -194,6 +267,8 @@ class HtspGuide(private val client: TvhClient, private val listener: Listener) :
         private const val TAG = "HtspGuide"
         private const val SERVICE_CONTENT_RADIO = 2
         private const val DUMP_TIMEOUT_S = 180L
+        /** Generous: on the shared connection a timed-out request closes it, playback included. */
+        private const val GET_EVENTS_TIMEOUT_MS = 30_000L
 
         /**
          * Decodes every guide's messages, in arrival order, at background priority: on a busy

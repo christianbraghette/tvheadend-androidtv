@@ -57,7 +57,8 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
     private val output = BufferedOutputStream(socket.getOutputStream())
     private val seq = AtomicInteger()
     private val subscriptionIds = AtomicInteger()
-    private val pending = ConcurrentHashMap<Int, CompletableFuture<HtsMsg>>()
+    /** Replies by seq, still encoded: the requester decodes them, never the reader thread. */
+    private val pending = ConcurrentHashMap<Int, CompletableFuture<ByteArray>>()
     private val subscriptions = ConcurrentHashMap<Int, SubscriptionListener>()
 
     private val closed = AtomicBoolean()
@@ -114,11 +115,12 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
     fun request(msg: HtsMsg, timeoutMs: Long = 10_000): HtsMsg {
         val id = seq.incrementAndGet()
         msg["seq"] = id
-        val reply = CompletableFuture<HtsMsg>()
+        val reply = CompletableFuture<ByteArray>()
         pending[id] = reply
         try {
             send(msg)
-            val result = reply.get(timeoutMs, TimeUnit.MILLISECONDS)
+            val bytes = reply.get(timeoutMs, TimeUnit.MILLISECONDS)
+            val result = HtsMsg.deserialize(bytes, 0, bytes.size)
             result.str("error")?.let { throw IOException("HTSP ${msg.method}: $it") }
             if (result.int("noaccess") == 1) throw IOException("HTSP access denied: check the user's HTSP streaming rights")
             return result
@@ -203,7 +205,8 @@ class HtspConnection private constructor(private val socket: Socket) : Closeable
                     }
                 }
                 if (replyTo != NONE) {
-                    pending[replyTo.toInt()]?.complete(HtsMsg.deserialize(body, 0, length)) // copies its values
+                    // Some replies are large (a channel's guide): only copy them here, the requester decodes.
+                    pending[replyTo.toInt()]?.complete(body.copyOf(length))
                     BufferPool.recycle(body)
                     continue
                 }

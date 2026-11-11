@@ -15,7 +15,7 @@ regular TV source in Live Channels and in any other app that lists TV inputs.
 | `StartBufferTuner` / `LiveLoadControl` | Per-channel start buffer, learned from how low the buffer gets while watching: channels that arrive evenly start faster, ones that stall get more cushion. |
 | `NeighbourPrewarmer` | HTSP only, off by default (setup option "Pre-tune neighbouring channels"): keeps the previous/next channel tuned at low priority when they are on another multiplex, with their streams switched off, so zapping to them skips the retune. Dropped after 2 minutes without zapping. |
 | `TvProviderSync` | Writes channels and EPG into `TvContract.Channels` / `TvContract.Programs`, including channel logos and radio channel detection. Gets them over HTSP, or from `/api/channel/grid` and `/api/epg/events/grid` when HTSP isn't available. |
-| `SyncWorker` | WorkManager job that refreshes channels and EPG every 6 hours, skipped while the TV input follows the guide live. |
+| `SyncWorker` | WorkManager job that refreshes channels and EPG every 6 hours. While the TV input follows the guide live, it resyncs on that same connection (HTSP `getEvents`, channel by channel) instead of opening another. A failed guide write also triggers such a resync a minute later. |
 | `SetupActivity` | Server settings. The TV app opens it when the source is added, and from its channel source settings later. |
 | `TvhAuthenticator` | HTTP Basic and Digest (MD5 / SHA-256) auth, matching tvheadend's auth modes. |
 
